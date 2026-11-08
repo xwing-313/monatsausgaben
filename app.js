@@ -1,16 +1,18 @@
-/* Monatsausgaben – wiederkehrende Ausgaben und Einnahmen.
+/* Monatsausgaben – wiederkehrende und einmalige Ausgaben und Einnahmen.
    Alle Daten bleiben lokal im localStorage dieses Geräts. */
 'use strict';
 
 /* ---------- Konstanten ---------- */
 
-const APP_VERSION = '1.0.0';
-const SCHEMA_VERSION = 1;          // Bei Änderungen am Datenformat erhöhen und unten eine Migration ergänzen
+const APP_VERSION = '1.1.0';
+const SCHEMA_VERSION = 2;          // Bei Änderungen am Datenformat erhöhen und unten eine Migration ergänzen
 const STORAGE_KEY = 'monatsausgaben';
 const BACKUP_REMINDER_DAYS = 30;
+const UPCOMING_DAYS = 30;
+const DEADLINE_WARN_DAYS = 30;
 
 const DEFAULT_CATEGORIES = {
-  expense: ['Wohnen', 'Versicherungen', 'Abos & Medien', 'Telefon & Internet', 'Mobilität', 'Sport & Freizeit', 'Sparen & Vorsorge', 'Sonstiges'],
+  expense: ['Wohnen', 'Versicherungen', 'Abos & Medien', 'Telefon & Internet', 'Mobilität', 'Sport & Freizeit', 'Sparen & Vorsorge', 'Anschaffungen', 'Sonstiges'],
   income: ['Gehalt', 'Nebenjob', 'Unterstützung', 'Sonstiges']
 };
 
@@ -21,15 +23,34 @@ const INTERVAL_PRESETS = [
   { key: 'm2', unit: 'month', every: 2, label: 'Alle 2 Monate' },
   { key: 'm3', unit: 'month', every: 3, label: 'Vierteljährlich' },
   { key: 'm6', unit: 'month', every: 6, label: 'Halbjährlich' },
-  { key: 'm12', unit: 'month', every: 12, label: 'Jährlich' }
+  { key: 'm12', unit: 'month', every: 12, label: 'Jährlich' },
+  { key: 'once', unit: 'once', every: 1, label: 'Einmalig' }
 ];
+
+const RENEW_OPTIONS = [
+  { value: 1, label: 'um 1 Monat' },
+  { value: 3, label: 'um 3 Monate' },
+  { value: 6, label: 'um 6 Monate' },
+  { value: 12, label: 'um 1 Jahr' },
+  { value: 24, label: 'um 2 Jahre' },
+  { value: 0, label: 'gar nicht' }
+];
+const NOTICE_UNITS = { days: 'Tage', weeks: 'Wochen', months: 'Monate' };
 
 const MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
 const MONTH_INITIALS = ['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D'];
+const WEEKDAYS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
 
-/* Migrationen: MIGRATIONS[n] wandelt Daten von Schema n in Schema n+1 um.
-   Beispiel für später:  1: (d) => { d.items.forEach(i => { i.prices = [{ from: i.startDate, amount: i.amount }]; }); } */
-const MIGRATIONS = {};
+/* Migrationen: MIGRATIONS[n] wandelt Daten von Schema n in Schema n+1 um. */
+const MIGRATIONS = {
+  // 1 → 2: Ein fester Betrag wird zu einem Preisverlauf (für Preisänderungen mit Datum)
+  1: (d) => {
+    (d.items || []).forEach((i) => {
+      if (i && !Array.isArray(i.prices) && i.amount != null) i.prices = [{ from: i.startDate, amount: Number(i.amount) }];
+      if (i) delete i.amount;
+    });
+  }
+};
 
 /* ---------- Datums-Helfer (ohne Zeitzonen-Fallen) ---------- */
 
@@ -40,22 +61,38 @@ const D = {
   dim(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); },
   num(s) { const { y, m, d } = D.parse(s); return Date.UTC(y, m - 1, d) / 864e5; },
   fromNum(n) { const t = new Date(n * 864e5); return D.iso(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate()); },
+  addDays(s, n) { return D.fromNum(D.num(s) + n); },
   today() { const t = new Date(); return D.iso(t.getFullYear(), t.getMonth() + 1, t.getDate()); },
   mi(y, m) { return y * 12 + (m - 1); },
   addMonths(ym, k) { const i = D.mi(ym.y, ym.m) + k; return { y: Math.floor(i / 12), m: (i % 12) + 1 }; },
+  /** Datum um k Monate verschieben. Ein Monatsletzter bleibt ein Monatsletzter. */
+  shiftMonths(s, k) {
+    const p = D.parse(s);
+    const ym = D.addMonths(p, k);
+    const lastDay = p.d === D.dim(p.y, p.m);
+    return D.iso(ym.y, ym.m, lastDay ? D.dim(ym.y, ym.m) : Math.min(p.d, D.dim(ym.y, ym.m)));
+  },
+  monthEnd(y, m) { return D.iso(y, m, D.dim(y, m)); },
   valid(s) {
     if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
     const { y, m, d } = D.parse(s);
     return m >= 1 && m <= 12 && d >= 1 && d <= D.dim(y, m);
   },
   short(s) { const { m, d } = D.parse(s); return `${pad(d)}.${pad(m)}.`; },
-  long(s) { const { y, m, d } = D.parse(s); return `${pad(d)}.${pad(m)}.${y}`; }
+  long(s) { const { y, m, d } = D.parse(s); return `${pad(d)}.${pad(m)}.${y}`; },
+  weekday(s) { return WEEKDAYS[new Date(D.num(s) * 864e5).getUTCDay()]; }
 };
 
+const round2 = (n) => Math.round(n * 100) / 100;
 const money = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
-const fmt = (n) => money.format(Math.round(n * 100) / 100 + 0);
+const moneyRound = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 });
+const fmt = (n) => money.format(round2(n) + 0);
+const fmt0 = (n) => moneyRound.format(Math.round(n) + 0);
 
 /* ---------- Rechenlogik ---------- */
+
+const isOnce = (item) => item.interval.unit === 'once';
+const isMonthly = (item) => item.interval.unit === 'month' && item.interval.every === 1;
 
 function intervalLabel(iv) {
   const preset = INTERVAL_PRESETS.find((p) => p.unit === iv.unit && p.every === iv.every);
@@ -63,17 +100,30 @@ function intervalLabel(iv) {
   return iv.unit === 'week' ? `alle ${iv.every} Wochen` : `alle ${iv.every} Monate`;
 }
 
-function isMonthly(item) { return item.interval.unit === 'month' && item.interval.every === 1; }
+/** Betrag, der an einem Datum gilt (Preisverlauf) */
+function priceAt(item, date) {
+  let p = item.prices[0].amount;
+  for (const pr of item.prices) {
+    if (pr.from <= date) p = pr.amount; else break;
+  }
+  return p;
+}
 
-/** Durchschnittlicher Betrag pro Monat (Quartal ÷ 3, Jahr ÷ 12, Woche × 52,18 ÷ 12) */
-function monthlyAverage(item) {
+/** Durchschnitt pro Monat (Quartal ÷ 3, Jahr ÷ 12, Woche × 52,18 ÷ 12). Einmalige Posten zählen nicht. */
+function monthlyAverage(item, atDate = D.today()) {
+  if (isOnce(item)) return 0;
+  const price = priceAt(item, atDate);
   const every = item.interval.every;
-  if (item.interval.unit === 'week') return item.amount * (365.25 / 12) / (7 * every);
-  return item.amount / every;
+  if (item.interval.unit === 'week') return price * (365.25 / 12) / (7 * every);
+  return price / every;
 }
 
 /** Alle Zahlungstermine eines Eintrags im Monat y/m */
 function occurrencesInMonth(item, y, m) {
+  if (isOnce(item)) {
+    const p = D.parse(item.startDate);
+    return p.y === y && p.m === m ? [item.startDate] : [];
+  }
   const start = D.parse(item.startDate);
   const end = item.endDate ? D.num(item.endDate) : Infinity;
   const every = item.interval.every;
@@ -88,7 +138,7 @@ function occurrencesInMonth(item, y, m) {
   const step = 7 * every;
   const s = D.num(item.startDate);
   const first = D.num(D.iso(y, m, 1));
-  const last = D.num(D.iso(y, m, D.dim(y, m)));
+  const last = D.num(D.monthEnd(y, m));
   if (last < s) return [];
   const out = [];
   for (let t = s + Math.max(0, Math.ceil((first - s) / step)) * step; t <= last && t <= end; t += step) {
@@ -97,18 +147,22 @@ function occurrencesInMonth(item, y, m) {
   return out;
 }
 
-/** Läuft der Eintrag (zumindest teilweise) im Monat y/m? */
+/** Zählt ein wiederkehrender Eintrag im Monat y/m zum Durchschnitt? */
 function isActiveInMonth(item, y, m) {
+  if (isOnce(item)) return false;
   const first = D.iso(y, m, 1);
-  const last = D.iso(y, m, D.dim(y, m));
-  return item.startDate <= last && (!item.endDate || item.endDate >= first);
+  return item.startDate <= D.monthEnd(y, m) && (!item.endDate || item.endDate >= first);
 }
 
-function isEnded(item, today = D.today()) { return !!item.endDate && item.endDate < today; }
+function isEnded(item, today = D.today()) {
+  if (isOnce(item)) return item.startDate < today;
+  return !!item.endDate && item.endDate < today;
+}
 
 function nextOccurrence(item, from = D.today()) {
+  if (isOnce(item)) return item.startDate >= from ? item.startDate : null;
   if (item.endDate && item.endDate < from) return null;
-  const f = D.parse(from);
+  const f = D.parse(from < item.startDate ? item.startDate : from);
   const limit = (item.interval.unit === 'month' ? item.interval.every : 1) + 2;
   for (let k = 0; k <= limit; k++) {
     const ym = D.addMonths(f, k);
@@ -118,26 +172,90 @@ function nextOccurrence(item, from = D.today()) {
   return null;
 }
 
+/** Alle Zahlungen zwischen zwei Daten (inklusive) */
+function paymentsBetween(fromDate, toDate, items = state.items) {
+  const out = [];
+  const a = D.parse(fromDate);
+  const b = D.parse(toDate);
+  const months = D.mi(b.y, b.m) - D.mi(a.y, a.m);
+  for (let k = 0; k <= months; k++) {
+    const ym = D.addMonths(a, k);
+    for (const item of items) {
+      for (const date of occurrencesInMonth(item, ym.y, ym.m)) {
+        if (date >= fromDate && date <= toDate) out.push({ item, date, amount: priceAt(item, date) });
+      }
+    }
+  }
+  return out.sort((x, y) => x.date.localeCompare(y.date) || y.amount - x.amount);
+}
+
 function monthSummary(y, m, items = state.items) {
   const res = {
     avg: { income: 0, expense: 0 },
     actual: { income: 0, expense: 0 },
+    once: { income: 0, expense: 0 },
     payments: [],
     categories: {}
   };
+  const ref = D.monthEnd(y, m);
   for (const item of items) {
     if (isActiveInMonth(item, y, m)) {
-      const avg = monthlyAverage(item);
+      const avg = monthlyAverage(item, ref);
       res.avg[item.type] += avg;
       if (item.type === 'expense') res.categories[item.category] = (res.categories[item.category] || 0) + avg;
     }
     for (const date of occurrencesInMonth(item, y, m)) {
-      res.actual[item.type] += item.amount;
-      res.payments.push({ item, date, amount: item.amount });
+      const amount = priceAt(item, date);
+      res.actual[item.type] += amount;
+      if (isOnce(item)) res.once[item.type] += amount;
+      res.payments.push({ item, date, amount });
     }
   }
   res.payments.sort((a, b) => a.date.localeCompare(b.date) || b.amount - a.amount);
   return res;
+}
+
+/** Kündigungsfrist: nächstes mögliches Vertragsende und der Tag, bis zu dem gekündigt sein muss */
+function cancellationInfo(item, today = D.today()) {
+  const c = item.cancel;
+  if (!c || isOnce(item) || isEnded(item, today) || item.endDate) return null;
+  const deadlineFor = (end) => {
+    if (c.noticeUnit === 'months') return D.shiftMonths(end, -c.notice);
+    return D.addDays(end, -(c.noticeUnit === 'weeks' ? 7 : 1) * c.notice);
+  };
+  for (let n = 0; n < 1200; n++) {
+    if (n > 0 && !c.renewMonths) return { expired: true, termEnd: c.termEnd };
+    const end = n === 0 ? c.termEnd : D.shiftMonths(c.termEnd, n * c.renewMonths);
+    const deadline = deadlineFor(end);
+    if (deadline >= today) return { termEnd: end, deadline, daysLeft: D.num(deadline) - D.num(today) };
+  }
+  return null;
+}
+
+/** Rücklagen: was du monatlich für seltene und geplante Zahlungen zurücklegen solltest */
+function reserveRows(today = D.today()) {
+  const t = D.parse(today);
+  const rows = [];
+  for (const item of state.items) {
+    if (item.type !== 'expense' || isEnded(item, today)) continue;
+    if (isOnce(item)) {
+      if (item.startDate <= today) continue;
+      const due = D.parse(item.startDate);
+      const months = Math.max(1, D.mi(due.y, due.m) - D.mi(t.y, t.m));
+      const amount = priceAt(item, item.startDate);
+      rows.push({ item, kind: 'once', next: item.startDate, amount, perMonth: amount / months, months, target: null });
+      continue;
+    }
+    if (item.interval.unit !== 'month' || item.interval.every === 1) continue;
+    const next = nextOccurrence(item, today);
+    if (!next) continue;
+    const prev = D.shiftMonths(next, -item.interval.every);
+    const span = D.num(next) - D.num(prev);
+    const share = Math.min(1, Math.max(0, (D.num(today) - D.num(prev)) / span));
+    const amount = priceAt(item, next);
+    rows.push({ item, kind: 'recurring', next, amount, perMonth: amount / item.interval.every, target: item.startDate > today ? 0 : amount * share });
+  }
+  return rows.sort((a, b) => a.next.localeCompare(b.next));
 }
 
 /* ---------- Daten laden, prüfen, speichern ---------- */
@@ -156,26 +274,51 @@ function defaultState() {
   };
 }
 
+function normalizeCancel(c) {
+  if (!c || typeof c !== 'object' || !D.valid(c.termEnd)) return null;
+  const notice = Math.round(Number(c.notice));
+  const renew = Math.round(Number(c.renewMonths));
+  return {
+    termEnd: c.termEnd,
+    renewMonths: renew >= 0 && renew <= 120 ? renew : 0,
+    notice: notice >= 0 && notice <= 400 ? notice : 0,
+    noticeUnit: NOTICE_UNITS[c.noticeUnit] ? c.noticeUnit : 'months'
+  };
+}
+
 function normalizeItem(raw) {
   if (!raw || typeof raw !== 'object') return null;
-  const amount = Number(raw.amount);
   const iv = raw.interval || {};
-  const every = Math.round(Number(iv.every));
   if (typeof raw.name !== 'string' || !raw.name.trim()) return null;
-  if (!(amount > 0) || !D.valid(raw.startDate)) return null;
-  if (!['week', 'month'].includes(iv.unit) || !(every >= 1 && every <= 120)) return null;
-  return {
+  if (!D.valid(raw.startDate)) return null;
+  if (!['week', 'month', 'once'].includes(iv.unit)) return null;
+  const every = iv.unit === 'once' ? 1 : Math.round(Number(iv.every));
+  if (!(every >= 1 && every <= 120)) return null;
+
+  let prices = Array.isArray(raw.prices)
+    ? raw.prices.filter((p) => p && D.valid(p.from) && Number(p.amount) > 0).map((p) => ({ from: p.from, amount: round2(Number(p.amount)) }))
+    : [];
+  if (!prices.length && Number(raw.amount) > 0) prices = [{ from: raw.startDate, amount: round2(Number(raw.amount)) }];
+  if (!prices.length) return null;
+  prices.sort((a, b) => a.from.localeCompare(b.from));
+  prices = prices.filter((p, i) => i === prices.length - 1 || prices[i + 1].from !== p.from);
+  if (iv.unit === 'once') prices = [{ from: raw.startDate, amount: prices[prices.length - 1].amount }];
+
+  const out = {
     ...raw, // unbekannte Felder aus neueren Versionen bleiben erhalten
     id: typeof raw.id === 'string' && raw.id ? raw.id : uid(),
     type: raw.type === 'income' ? 'income' : 'expense',
     name: raw.name.trim().slice(0, 60),
-    amount: Math.round(amount * 100) / 100,
+    prices,
     interval: { unit: iv.unit, every },
     startDate: raw.startDate,
-    endDate: D.valid(raw.endDate) && raw.endDate >= raw.startDate ? raw.endDate : null,
+    endDate: iv.unit !== 'once' && D.valid(raw.endDate) && raw.endDate >= raw.startDate ? raw.endDate : null,
+    cancel: iv.unit === 'once' ? null : normalizeCancel(raw.cancel),
     category: typeof raw.category === 'string' && raw.category ? raw.category : 'Sonstiges',
     note: typeof raw.note === 'string' ? raw.note.slice(0, 300) : ''
   };
+  delete out.amount;
+  return out;
 }
 
 function normalize(d) {
@@ -209,7 +352,14 @@ function load() {
   try {
     raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return defaultState();
-    return migrate(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const data = migrate(parsed);
+    if (Number(parsed.schemaVersion) !== SCHEMA_VERSION) {
+      // Vor dem Überschreiben eine Kopie im alten Format behalten
+      try { localStorage.setItem(`${STORAGE_KEY}-schema${Number(parsed.schemaVersion) || 1}`, raw); } catch (_) { /* ignorieren */ }
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    }
+    return data;
   } catch (err) {
     console.error(err);
     // Unlesbare Daten nicht überschreiben, sondern beiseitelegen
@@ -235,6 +385,7 @@ const ui = {
   tab: 'overview',
   month: (() => { const t = D.parse(D.today()); return { y: t.y, m: t.m }; })(),
   entryFilter: 'active',
+  whatIfOff: new Set(),
   pendingReload: false
 };
 
@@ -257,10 +408,21 @@ function parseAmount(input) {
   if (s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
   else if (/^\d{1,3}(\.\d{3})+$/.test(s)) s = s.replace(/\./g, ''); // 1.234 = Tausenderpunkt
   if (!/^\d+(\.\d{1,2})?$/.test(s)) return NaN;
-  return Math.round(parseFloat(s) * 100) / 100;
+  return round2(parseFloat(s));
 }
 
 function amountToInput(n) { return n.toFixed(2).replace('.', ','); }
+
+function listJoin(arr) {
+  if (arr.length <= 1) return arr.join('');
+  return arr.slice(0, -1).join(', ') + ' und ' + arr[arr.length - 1];
+}
+
+function daysText(n) {
+  if (n === 0) return 'heute';
+  if (n === 1) return 'morgen';
+  return `in ${n} Tagen`;
+}
 
 const ICON = {
   prev: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>',
@@ -274,11 +436,11 @@ const ICON = {
 /** Takt-Leiste: zeigt für die nächsten 12 Monate, in welchen Monaten gezahlt wird */
 function rhythmStrip(item, from) {
   let html = '';
-  let label = [];
+  const label = [];
   for (let k = 0; k < 12; k++) {
     const ym = D.addMonths(from, k);
     const hits = occurrencesInMonth(item, ym.y, ym.m).length;
-    const active = isActiveInMonth(item, ym.y, ym.m);
+    const active = isOnce(item) || isActiveInMonth(item, ym.y, ym.m);
     if (hits) label.push(MONTHS[ym.m - 1]);
     html += `<span class="beat${hits ? ' on' : ''}${active ? '' : ' off'}"><i></i><small>${MONTH_INITIALS[ym.m - 1]}</small></span>`;
   }
@@ -288,7 +450,38 @@ function rhythmStrip(item, from) {
   return `<span class="rhythm" role="img" aria-label="${esc(aria)}">${html}</span>`;
 }
 
-/* ---------- Ansichten ---------- */
+function topbar(title, withAdd = true) {
+  return `
+    <header class="topbar">
+      <h1>${title}</h1>
+      ${withAdd ? `<button class="add-btn" type="button" data-action="add" aria-label="Eintrag hinzufügen">${ICON.plus}</button>` : ''}
+    </header>`;
+}
+
+function emptyState(text, button = 'Ersten Eintrag anlegen') {
+  return `
+    <section class="empty">
+      <div class="empty-rhythm" aria-hidden="true">${'<i></i>'.repeat(12)}</div>
+      <h2>Noch nichts eingetragen</h2>
+      <p>${text}</p>
+      <button class="btn primary" type="button" data-action="add">${button}</button>
+    </section>`;
+}
+
+function payRow(p, showWeekday = false) {
+  const once = isOnce(p.item);
+  const day = D.parse(p.date).d;
+  return `
+    <li>
+      <button class="pay" type="button" data-action="edit" data-id="${esc(p.item.id)}">
+        <span class="pay-date">${showWeekday ? `<small>${D.weekday(p.date)}</small>` : ''}<b>${day}.</b></span>
+        <span class="pay-text"><span class="pay-name">${esc(p.item.name)}</span><small>${once ? 'einmalig' : esc(intervalLabel(p.item.interval))}${showWeekday ? `, ${D.short(p.date)}` : ''}</small></span>
+        <span class="pay-amount ${p.item.type}">${p.item.type === 'income' ? '+' : '−'}${fmt(p.amount)}</span>
+      </button>
+    </li>`;
+}
+
+/* ---------- Ansicht: Übersicht ---------- */
 
 function renderOverview() {
   const { y, m } = ui.month;
@@ -310,13 +503,7 @@ function renderOverview() {
     </header>`;
 
   if (state.items.length === 0) {
-    return header + `
-      <section class="empty">
-        <div class="empty-rhythm" aria-hidden="true">${'<i></i>'.repeat(12)}</div>
-        <h2>Noch nichts eingetragen</h2>
-        <p>Trag deine wiederkehrenden Ausgaben und Einnahmen ein, egal ob monatlich, vierteljährlich oder jährlich. Die App rechnet aus, was dich ein Monat im Schnitt kostet und was wirklich abgebucht wird.</p>
-        <button class="btn primary" type="button" data-action="add">Ersten Eintrag anlegen</button>
-      </section>`;
+    return header + emptyState('Trag deine wiederkehrenden Ausgaben und Einnahmen ein, egal ob monatlich, vierteljährlich oder jährlich. Die App rechnet aus, was dich ein Monat im Schnitt kostet und was wirklich abgebucht wird.');
   }
 
   const s = monthSummary(y, m);
@@ -324,29 +511,26 @@ function renderOverview() {
   const netAct = s.actual.income - s.actual.expense;
   const diff = s.actual.expense - s.avg.expense;
 
-  const rare = s.payments.filter((p) => p.item.type === 'expense' && !isMonthly(p.item));
-  const rareNames = [...new Set(rare.map((p) => p.item.name))];
+  const rareNames = [...new Set(s.payments.filter((p) => p.item.type === 'expense' && !isMonthly(p.item) && !isOnce(p.item)).map((p) => p.item.name))];
+  const onceNames = [...new Set(s.payments.filter((p) => p.item.type === 'expense' && isOnce(p.item)).map((p) => p.item.name))];
+  const dueParts = [];
+  if (rareNames.length) dueParts.push(listJoin(rareNames));
+  if (onceNames.length) dueParts.push(`einmalig ${listJoin(onceNames)}`);
+
   let note;
   if (Math.abs(diff) < 0.5) {
     note = `Im ${monthName} wird genau so viel abgebucht wie im Schnitt.`;
   } else if (diff > 0) {
-    note = `Im ${monthName} zahlst du <b>${fmt(diff)} mehr</b> als im Schnitt. Fällig ${rareNames.length === 1 ? 'wird' : 'werden'} ${esc(listJoin(rareNames))}.`;
+    const verb = rareNames.length + onceNames.length === 1 ? 'wird' : 'werden';
+    note = `Im ${monthName} zahlst du <b>${fmt(diff)} mehr</b> als im Schnitt.${dueParts.length ? ` Fällig ${verb} ${esc(dueParts.join(', außerdem '))}.` : ''}`;
   } else {
     note = `Im ${monthName} zahlst du <b>${fmt(-diff)} weniger</b> als im Schnitt, weil seltenere Zahlungen diesmal nicht fällig sind.`;
   }
-
-  const backupBanner = backupReminder();
+  if (s.once.expense || s.once.income) note += ' Einmalige Posten zählen nur in ihrem Monat, nicht im Schnitt.';
 
   const payments = s.payments.length
-    ? s.payments.map((p) => `
-        <li>
-          <button class="pay" type="button" data-action="edit" data-id="${esc(p.item.id)}">
-            <span class="pay-date"><b>${D.parse(p.date).d}.</b></span>
-            <span class="pay-text"><span class="pay-name">${esc(p.item.name)}</span><small>${esc(intervalLabel(p.item.interval))}</small></span>
-            <span class="pay-amount ${p.item.type}">${p.item.type === 'income' ? '+' : '−'}${fmt(p.amount)}</span>
-          </button>
-        </li>`).join('')
-    : `<li class="muted-row">In diesem Monat ist keine Zahlung fällig.</li>`;
+    ? s.payments.map((p) => payRow(p)).join('')
+    : '<li class="muted-row">In diesem Monat ist keine Zahlung fällig.</li>';
 
   const cats = Object.entries(s.categories).sort((a, b) => b[1] - a[1]);
   const maxCat = cats.length ? cats[0][1] : 1;
@@ -356,10 +540,10 @@ function renderOverview() {
           <div class="cat-top"><span>${esc(name)}</span><span>${fmt(val)}</span></div>
           <div class="cat-bar"><i style="width:${Math.max(2, (val / maxCat) * 100).toFixed(1)}%"></i></div>
         </li>`).join('')
-    : `<li class="muted-row">Keine laufenden Ausgaben in diesem Monat.</li>`;
+    : '<li class="muted-row">Keine laufenden Ausgaben in diesem Monat.</li>';
 
   return header + `
-    ${backupBanner}
+    ${backupReminder()}
     <section class="ledger" aria-label="Monatsbilanz">
       <div class="ledger-row ledger-head">
         <span></span><span>Im Schnitt</span><span>Im ${monthName}</span>
@@ -387,11 +571,6 @@ function renderOverview() {
     </section>`;
 }
 
-function listJoin(arr) {
-  if (arr.length <= 1) return arr.join('');
-  return arr.slice(0, -1).join(', ') + ' und ' + arr[arr.length - 1];
-}
-
 function backupReminder() {
   if (state.items.length === 0) return '';
   const last = state.settings.lastBackupAt;
@@ -405,73 +584,248 @@ function backupReminder() {
     </div>`;
 }
 
+/* ---------- Ansicht: Vorschau ---------- */
+
+function renderPlan() {
+  if (state.items.length === 0) {
+    return topbar('Vorschau') + emptyState('Sobald du Einträge angelegt hast, siehst du hier die nächsten Zahlungen, die teuren Monate und was du zurücklegen solltest.');
+  }
+  const today = D.today();
+  const t = D.parse(today);
+
+  // Demnächst
+  const upcoming = paymentsBetween(today, D.addDays(today, UPCOMING_DAYS));
+  const deadlines = state.items
+    .map((item) => ({ item, info: cancellationInfo(item, today) }))
+    .filter((d) => d.info && !d.info.expired)
+    .sort((a, b) => a.info.deadline.localeCompare(b.info.deadline));
+  const urgent = deadlines.filter((d) => d.info.daysLeft <= DEADLINE_WARN_DAYS);
+  const upcomingOut = upcoming.filter((p) => p.item.type === 'expense').reduce((sum, p) => sum + p.amount, 0);
+
+  const urgentHtml = urgent.map((d) => `
+    <li>
+      <button class="alert-row" type="button" data-action="edit" data-id="${esc(d.item.id)}">
+        <span><b>${esc(d.item.name)}</b> kündigen, falls nicht mehr gewünscht</span>
+        <small>Frist ${daysText(d.info.daysLeft)} (${D.long(d.info.deadline)}), sonst Verlängerung über den ${D.long(d.info.termEnd)} hinaus</small>
+      </button>
+    </li>`).join('');
+
+  const upcomingHtml = upcoming.length
+    ? upcoming.map((p) => payRow(p, true)).join('')
+    : '<li class="muted-row">In den nächsten 30 Tagen ist nichts fällig.</li>';
+
+  // 12 Monate
+  const months = [];
+  for (let k = 0; k < 12; k++) {
+    const ym = D.addMonths(t, k);
+    const s = monthSummary(ym.y, ym.m);
+    months.push({ ...ym, exp: s.actual.expense, inc: s.actual.income });
+  }
+  const avgNow = monthSummary(t.y, t.m).avg.expense;
+  const max = Math.max(avgNow, ...months.map((x) => x.exp), 1);
+  const peak = months.reduce((a, b) => (b.exp > a.exp ? b : a), months[0]);
+  const yearOut = months.reduce((sum, x) => sum + x.exp, 0);
+  const yearIn = months.reduce((sum, x) => sum + x.inc, 0);
+  const bars = months.map((x) => {
+    const h = (x.exp / max) * 100;
+    const high = x.exp > avgNow + 0.5;
+    return `
+      <button class="bar${high ? ' high' : ''}" type="button" data-action="goto-month" data-y="${x.y}" data-m="${x.m}" aria-label="${MONTHS[x.m - 1]} ${x.y}: ${fmt(x.exp)}">
+        <span class="bar-val">${Math.round(x.exp)}</span>
+        <span class="bar-track"><i style="height:${h.toFixed(1)}%"></i></span>
+        <small>${MONTH_INITIALS[x.m - 1]}</small>
+      </button>`;
+  }).join('');
+
+  // Rücklagen
+  const reserves = reserveRows(today);
+  const recurringRes = reserves.filter((r) => r.kind === 'recurring');
+  const onceRes = reserves.filter((r) => r.kind === 'once');
+  const reservePerMonth = reserves.reduce((sum, r) => sum + r.perMonth, 0);
+  const reserveTarget = recurringRes.reduce((sum, r) => sum + r.target, 0);
+  const reserveHtml = reserves.length ? `
+      <div class="reserve-sum">
+        <div><small>Pro Monat zurücklegen</small><b>${fmt(reservePerMonth)}</b></div>
+        <div><small>Sollte heute im Topf sein</small><b>${fmt(reserveTarget)}</b></div>
+      </div>
+      <ul class="plain-list">
+        ${recurringRes.map((r) => `
+          <li>
+            <button class="row" type="button" data-action="edit" data-id="${esc(r.item.id)}">
+              <span class="row-main"><span>${esc(r.item.name)}</span><b>${fmt(r.perMonth)} / Monat</b></span>
+              <span class="row-sub"><span>${fmt(r.amount)} fällig am ${D.long(r.next)}</span><span>jetzt ${fmt(r.target)}</span></span>
+            </button>
+          </li>`).join('')}
+        ${onceRes.map((r) => `
+          <li>
+            <button class="row" type="button" data-action="edit" data-id="${esc(r.item.id)}">
+              <span class="row-main"><span>${esc(r.item.name)}</span><b>${fmt(r.perMonth)} / Monat</b></span>
+              <span class="row-sub"><span>einmalig ${fmt(r.amount)} am ${D.long(r.next)}</span><span>${r.months === 1 ? 'diesen Monat' : `${r.months} Monate`}</span></span>
+            </button>
+          </li>`).join('')}
+      </ul>
+      <p class="hint">„Sollte heute im Topf sein“ ist der Anteil, der seit der letzten Zahlung angespart sein müsste. Für geplante Einmalausgaben teilt die App den Betrag auf die Monate bis zum Termin auf.</p>`
+    : '<p class="block-text">Keine seltenen oder geplanten Ausgaben, für die du zurücklegen musst.</p>';
+
+  // Kündigungsfristen
+  const deadlineHtml = deadlines.length
+    ? `<ul class="plain-list">${deadlines.map((d) => `
+        <li>
+          <button class="row${d.info.daysLeft <= DEADLINE_WARN_DAYS ? ' warn' : ''}" type="button" data-action="edit" data-id="${esc(d.item.id)}">
+            <span class="row-main"><span>${esc(d.item.name)}</span><b>bis ${D.long(d.info.deadline)}</b></span>
+            <span class="row-sub"><span>Ende zum ${D.long(d.info.termEnd)}</span><span>${daysText(d.info.daysLeft)}</span></span>
+          </button>
+        </li>`).join('')}</ul>`
+    : '<p class="block-text">Noch keine Kündigungsfristen hinterlegt. Öffne einen Vertrag und schalte „Kündigungsfrist merken“ ein.</p>';
+
+  // Jahreskosten und Was-wäre-wenn
+  const yearly = state.items
+    .filter((i) => i.type === 'expense' && !isOnce(i) && !isEnded(i, today))
+    .map((i) => ({ item: i, year: monthlyAverage(i, today) * 12 }))
+    .sort((a, b) => b.year - a.year);
+  const yearTotal = yearly.reduce((sum, r) => sum + r.year, 0);
+  const saved = yearly.filter((r) => ui.whatIfOff.has(r.item.id)).reduce((sum, r) => sum + r.year, 0);
+  const whatIfText = saved > 0
+    ? `Ohne die abgewählten Posten: <b>${fmt(yearTotal - saved)}</b> im Jahr. Du würdest <b>${fmt(saved)}</b> im Jahr sparen, also ${fmt(saved / 12)} im Monat.`
+    : 'Schalte Posten aus, um zu sehen, was du ohne sie sparen würdest. Es wird nichts geändert.';
+  const yearlyHtml = yearly.map((r) => {
+    const off = ui.whatIfOff.has(r.item.id);
+    return `
+      <li class="whatif${off ? ' is-off' : ''}">
+        <span class="row-main"><span>${esc(r.item.name)}</span><b>${fmt(r.year)}</b></span>
+        <input class="switch" type="checkbox" role="switch" data-action="whatif" data-id="${esc(r.item.id)}" ${off ? '' : 'checked'} aria-label="${esc(r.item.name)} in der Rechnung behalten">
+      </li>`;
+  }).join('');
+
+  return topbar('Vorschau') + `
+    ${urgent.length ? `<section class="block first"><h2>Fristen beachten</h2><ul class="alert-list">${urgentHtml}</ul></section>` : ''}
+
+    <section class="block${urgent.length ? '' : ' first'}">
+      <h2>Nächste 30 Tage <small>${fmt(upcomingOut)} Ausgaben</small></h2>
+      <ul class="pay-list">${upcomingHtml}</ul>
+    </section>
+
+    <section class="block">
+      <h2>Die nächsten 12 Monate <small>Ausgaben pro Monat</small></h2>
+      <div class="chart">
+        <div class="chart-bars">
+          <span class="chart-avg" style="--p:${(avgNow / max).toFixed(4)}"><em>Ø ${fmt0(avgNow)}</em></span>
+          ${bars}
+        </div>
+      </div>
+      <p class="ledger-note">Am teuersten wird der <b>${MONTHS[peak.m - 1]} ${peak.y}</b> mit ${fmt(peak.exp)}. In den nächsten 12 Monaten gehen ${fmt(yearOut)} raus und ${fmt(yearIn)} kommen rein. Tipp auf einen Monat für die Details.</p>
+    </section>
+
+    <section class="block">
+      <h2>Rücklagen</h2>
+      ${reserveHtml}
+    </section>
+
+    <section class="block">
+      <h2>Kündigungsfristen</h2>
+      ${deadlineHtml}
+    </section>
+
+    <section class="block">
+      <h2>Jahreskosten <small>${fmt(yearTotal)} im Jahr</small></h2>
+      <p class="block-text whatif-text">${whatIfText}</p>
+      <ul class="plain-list">${yearlyHtml || '<li class="muted-row">Keine laufenden Ausgaben.</li>'}</ul>
+    </section>`;
+}
+
+/* ---------- Ansicht: Einträge ---------- */
+
+function entryRow(item, today, from) {
+  const next = nextOccurrence(item, today);
+  const ended = isEnded(item, today);
+  const price = priceAt(item, today < item.startDate ? item.startDate : today);
+  const lines = [];
+  if (isOnce(item)) {
+    lines.push(`${ended ? 'War am' : 'Am'} ${D.long(item.startDate)}`);
+  } else if (ended) {
+    lines.push(`Beendet am ${D.long(item.endDate)}`);
+  } else {
+    if (next) lines.push(`Nächste ${D.short(next)}`);
+    if (item.endDate) lines.push(`endet ${D.long(item.endDate)}`);
+    const c = cancellationInfo(item, today);
+    if (c && !c.expired) lines.push(`<span class="${c.daysLeft <= DEADLINE_WARN_DAYS ? 'warn-text' : ''}">kündbar bis ${D.short(c.deadline)}</span>`);
+    const change = item.prices.find((p) => p.from > today);
+    if (change) lines.push(`ab ${D.short(change.from)} ${fmt(change.amount)}`);
+  }
+
+  let right = '';
+  if (isOnce(item)) right = '';
+  else if (isMonthly(item)) right = `${fmt(monthlyAverage(item, today) * 12)} im Jahr`;
+  else right = `≈ ${fmt(monthlyAverage(item, today))} / Monat`;
+
+  return `
+    <li>
+      <button class="entry${ended ? ' ended' : ''}" type="button" data-action="edit" data-id="${esc(item.id)}">
+        <span class="entry-main">
+          <span class="entry-name">${esc(item.name)}</span>
+          <span class="entry-amount ${item.type}">${item.type === 'income' ? '+' : ''}${fmt(price)}</span>
+        </span>
+        <span class="entry-sub">
+          <span>${esc(item.category)}, ${isOnce(item) ? 'einmalig' : esc(intervalLabel(item.interval))}</span>
+          ${right ? `<span>${right}</span>` : ''}
+        </span>
+        <span class="entry-foot">
+          ${rhythmStrip(item, from)}
+          <span class="entry-next">${lines.join('<br>')}</span>
+        </span>
+      </button>
+    </li>`;
+}
+
 function renderEntries() {
   const today = D.today();
   const from = D.parse(today);
-  const active = state.items.filter((i) => !isEnded(i, today));
-  const ended = state.items.filter((i) => isEnded(i, today));
-  const list = ui.entryFilter === 'ended' ? ended : active;
+  const current = state.items.filter((i) => !isEnded(i, today));
+  const archive = state.items.filter((i) => isEnded(i, today));
+  const list = ui.entryFilter === 'archive' ? archive : current;
 
-  const section = (type, title) => {
-    const items = list.filter((i) => i.type === type).sort((a, b) => monthlyAverage(b) - monthlyAverage(a));
+  const section = (title, items, withTotal) => {
     if (!items.length) return '';
-    const total = items.reduce((sum, i) => sum + monthlyAverage(i), 0);
-    const rows = items.map((item) => {
-      const next = nextOccurrence(item, today);
-      let foot;
-      if (isEnded(item, today)) foot = `Beendet am ${D.long(item.endDate)}`;
-      else if (item.endDate) foot = `Nächste ${next ? D.short(next) : '–'}<br>endet ${D.long(item.endDate)}`;
-      else foot = next ? `Nächste ${D.short(next)}` : '';
-      return `
-        <li>
-          <button class="entry${isEnded(item, today) ? ' ended' : ''}" type="button" data-action="edit" data-id="${esc(item.id)}">
-            <span class="entry-main">
-              <span class="entry-name">${esc(item.name)}</span>
-              <span class="entry-amount ${item.type}">${fmt(item.amount)}</span>
-            </span>
-            <span class="entry-sub">
-              <span>${esc(item.category)}, ${esc(intervalLabel(item.interval))}</span>
-              ${isMonthly(item) ? '' : `<span>≈ ${fmt(monthlyAverage(item))} / Monat</span>`}
-            </span>
-            <span class="entry-foot">
-              ${rhythmStrip(item, from)}
-              <span class="entry-next">${foot}</span>
-            </span>
-          </button>
-        </li>`;
-    }).join('');
-    const totalLabel = ui.entryFilter === 'ended' ? '' : `<small>${fmt(total)} / Monat im Schnitt</small>`;
-    return `<section class="block"><h2>${title} ${totalLabel}</h2><ul class="entry-list">${rows}</ul></section>`;
+    const total = items.reduce((sum, i) => sum + monthlyAverage(i, today), 0);
+    const totalLabel = withTotal ? `<small>${fmt(total)} / Monat im Schnitt</small>` : '';
+    return `<section class="block"><h2>${title} ${totalLabel}</h2><ul class="entry-list">${items.map((i) => entryRow(i, today, from)).join('')}</ul></section>`;
   };
+  const byAvg = (a, b) => monthlyAverage(b, today) - monthlyAverage(a, today);
+  const recurring = list.filter((i) => !isOnce(i));
+  const once = list.filter(isOnce).sort((a, b) => (ui.entryFilter === 'archive' ? b.startDate.localeCompare(a.startDate) : a.startDate.localeCompare(b.startDate)));
+  const isArchive = ui.entryFilter === 'archive';
 
-  const body = section('expense', 'Ausgaben') + section('income', 'Einnahmen');
-  const empty = ui.entryFilter === 'ended'
-    ? `<p class="empty-text">Noch nichts beendet. Wenn du etwas kündigst, öffne den Eintrag und trag den letzten Tag ein. Vergangene Monate bleiben dann richtig.</p>`
-    : `<section class="empty"><div class="empty-rhythm" aria-hidden="true">${'<i></i>'.repeat(12)}</div><h2>Keine laufenden Einträge</h2><p>Lege deine erste Ausgabe oder Einnahme an.</p><button class="btn primary" type="button" data-action="add">Eintrag anlegen</button></section>`;
+  const body = section('Ausgaben', recurring.filter((i) => i.type === 'expense').sort(byAvg), !isArchive)
+    + section('Einnahmen', recurring.filter((i) => i.type === 'income').sort(byAvg), !isArchive)
+    + section(isArchive ? 'Einmalig, vergangen' : 'Einmalig, geplant', once, false);
 
-  return `
-    <header class="topbar">
-      <h1>Einträge</h1>
-      <button class="add-btn" type="button" data-action="add" aria-label="Eintrag hinzufügen">${ICON.plus}</button>
-    </header>
+  const empty = isArchive
+    ? '<p class="empty-text">Hier landen gekündigte Verträge und vergangene Einmalposten. Wenn du etwas kündigst, öffne den Eintrag und trag den letzten Tag ein. Vergangene Monate bleiben dann richtig.</p>'
+    : emptyState('Lege deine erste Ausgabe oder Einnahme an.', 'Eintrag anlegen');
+
+  return topbar('Einträge') + `
     <div class="segmented" role="radiogroup" aria-label="Filter">
-      <button type="button" role="radio" aria-checked="${ui.entryFilter === 'active'}" data-action="filter" data-value="active">Laufend <span>${active.length}</span></button>
-      <button type="button" role="radio" aria-checked="${ui.entryFilter === 'ended'}" data-action="filter" data-value="ended">Beendet <span>${ended.length}</span></button>
+      <button type="button" role="radio" aria-checked="${!isArchive}" data-action="filter" data-value="active">Aktuell <span>${current.length}</span></button>
+      <button type="button" role="radio" aria-checked="${isArchive}" data-action="filter" data-value="archive">Archiv <span>${archive.length}</span></button>
     </div>
     ${body || empty}`;
 }
 
+/* ---------- Ansicht: Einstellungen ---------- */
+
 function renderSettings() {
   const last = state.settings.lastBackupAt;
-  const lastText = last ? `Letztes Backup am ${D.long(D.iso(new Date(last).getFullYear(), new Date(last).getMonth() + 1, new Date(last).getDate()))}` : 'Noch kein Backup gesichert';
+  let lastText = 'Noch kein Backup gesichert';
+  if (last) {
+    const dt = new Date(last);
+    lastText = `Letztes Backup am ${D.long(D.iso(dt.getFullYear(), dt.getMonth() + 1, dt.getDate()))}`;
+  }
   const theme = state.settings.theme;
   const catList = (type) => state.categories[type].map((c) => `
       <li><span>${esc(c)}</span><button class="icon-btn small" type="button" data-action="delete-category" data-type="${type}" data-value="${esc(c)}" aria-label="Kategorie ${esc(c)} entfernen">${ICON.trash}</button></li>`).join('');
 
-  return `
-    <header class="topbar"><h1>Einstellungen</h1></header>
-
-    <section class="block">
+  return topbar('Einstellungen', false) + `
+    <section class="block first">
       <h2>Datensicherung</h2>
       <p class="block-text">Deine Daten liegen nur auf diesem iPhone. Sichere sie regelmäßig als Datei, zum Beispiel in iCloud Drive über „In Dateien sichern“.</p>
       <div class="action-list">
@@ -512,7 +866,8 @@ function renderSettings() {
 
 function render() {
   const view = $('#view');
-  view.innerHTML = ui.tab === 'entries' ? renderEntries() : ui.tab === 'settings' ? renderSettings() : renderOverview();
+  const views = { overview: renderOverview, plan: renderPlan, entries: renderEntries, settings: renderSettings };
+  view.innerHTML = (views[ui.tab] || renderOverview)();
   document.querySelectorAll('.tab').forEach((t) => {
     const on = t.dataset.tab === ui.tab;
     t.classList.toggle('active', on);
@@ -526,17 +881,21 @@ function categoryOptions(type, selected) {
   const cats = [...state.categories[type]];
   if (selected && !cats.includes(selected)) cats.push(selected);
   return cats.map((c) => `<option value="${esc(c)}"${c === selected ? ' selected' : ''}>${esc(c)}</option>`).join('')
-    + `<option value="__new">Neue Kategorie …</option>`;
+    + '<option value="__new">Neue Kategorie …</option>';
 }
 
 function openEntrySheet(id) {
+  const today = D.today();
   const existing = id ? state.items.find((i) => i.id === id) : null;
   const item = existing || {
-    type: 'expense', name: '', amount: null, interval: { unit: 'month', every: 1 },
-    startDate: D.today(), endDate: null, category: state.categories.expense[0], note: ''
+    type: 'expense', name: '', prices: null, interval: { unit: 'month', every: 1 },
+    startDate: today, endDate: null, cancel: null, category: state.categories.expense[0], note: ''
   };
   const preset = INTERVAL_PRESETS.find((p) => p.unit === item.interval.unit && p.every === item.interval.every);
   const intervalKey = preset ? preset.key : 'custom';
+  let draftPrices = item.prices ? item.prices.map((p) => ({ ...p })) : [];
+  const shownPrice = existing ? priceAt(item, today < item.startDate ? item.startDate : today) : null;
+  const c = item.cancel || { termEnd: '', renewMonths: 1, notice: 1, noticeUnit: 'months' };
 
   const html = `
     <div class="sheet-backdrop" data-action="close-sheet"></div>
@@ -556,8 +915,8 @@ function openEntrySheet(id) {
           <label class="field"><span>Name</span>
             <input name="name" maxlength="60" autocomplete="off" placeholder="z. B. Handyvertrag" value="${esc(item.name)}">
           </label>
-          <label class="field"><span>Betrag</span>
-            <span class="money-input"><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${item.amount ? amountToInput(item.amount) : ''}"><em>€</em></span>
+          <label class="field"><span data-label="amount">${existing && !isOnce(item) ? 'Betrag aktuell' : 'Betrag'}</span>
+            <span class="money-input"><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${shownPrice ? amountToInput(shownPrice) : ''}"><em>€</em></span>
           </label>
           <label class="field"><span>Rhythmus</span>
             <select name="interval">
@@ -568,11 +927,11 @@ function openEntrySheet(id) {
           <label class="field" data-show="custom"${intervalKey === 'custom' ? '' : ' hidden'}><span>Alle wie viele Monate?</span>
             <input name="every" type="number" min="1" max="120" inputmode="numeric" value="${intervalKey === 'custom' ? item.interval.every : 4}">
           </label>
-          <label class="field"><span>Fällig am</span>
+          <label class="field"><span data-label="date">${isOnce(item) ? 'Datum' : 'Fällig am'}</span>
             <input name="startDate" type="date" value="${esc(item.startDate)}">
           </label>
         </div>
-        <p class="hint">Ein Tag, an dem die Zahlung fällig war oder wird. Ab da wiederholt sie sich im gewählten Rhythmus, davor rechnet die App nicht mit.</p>
+        <p class="hint" data-label="date-hint"></p>
 
         <div class="fields">
           <label class="field"><span>Kategorie</span>
@@ -583,19 +942,57 @@ function openEntrySheet(id) {
           </label>
         </div>
 
-        <div class="fields">
-          <label class="field switch-field"><span>Gekündigt oder befristet</span>
-            <input type="checkbox" name="hasEnd" role="switch"${item.endDate ? ' checked' : ''}>
-          </label>
-          <label class="field" data-show="end"${item.endDate ? '' : ' hidden'}><span>Letzter Tag</span>
-            <input name="endDate" type="date" value="${esc(item.endDate || '')}">
-          </label>
+        ${existing ? `
+        <div data-recurring>
+          <h3 class="sheet-sub">Preisverlauf</h3>
+          <ul class="price-list" id="price-list"></ul>
+          <div class="fields price-add" hidden>
+            <label class="field"><span>Neuer Betrag ab</span><input name="priceFrom" type="date" value="${today}"></label>
+            <label class="field"><span>Neuer Betrag</span><span class="money-input"><input name="priceAmount" inputmode="decimal" autocomplete="off" placeholder="0,00"><em>€</em></span></label>
+          </div>
+          <div class="price-buttons">
+            <button type="button" class="btn small" data-local="price-open">Preisänderung eintragen</button>
+            <button type="button" class="btn small primary" data-local="price-apply" hidden>Übernehmen</button>
+          </div>
+          <p class="hint">„Betrag aktuell“ korrigiert den heute gültigen Preis. Für eine Erhöhung ab einem Datum nutze die Preisänderung, dann bleiben frühere Monate richtig.</p>
+        </div>` : ''}
+
+        <div data-recurring>
+          <div class="fields">
+            <label class="field switch-field"><span>Gekündigt oder befristet</span>
+              <input class="switch" type="checkbox" name="hasEnd" role="switch"${item.endDate ? ' checked' : ''}>
+            </label>
+            <label class="field" data-show="end"${item.endDate ? '' : ' hidden'}><span>Letzter Tag</span>
+              <input name="endDate" type="date" value="${esc(item.endDate || '')}">
+            </label>
+          </div>
+          <p class="hint" data-show="end"${item.endDate ? '' : ' hidden'}>Danach fallen keine Zahlungen mehr an. Vergangene Monate bleiben unverändert.</p>
         </div>
-        <p class="hint" data-show="end"${item.endDate ? '' : ' hidden'}>Danach fallen keine Zahlungen mehr an. Vergangene Monate bleiben unverändert.</p>
+
+        <div data-recurring data-show="cancel-block"${item.endDate ? ' hidden' : ''}>
+          <div class="fields">
+            <label class="field switch-field"><span>Kündigungsfrist merken</span>
+              <input class="switch" type="checkbox" name="hasCancel" role="switch"${item.cancel ? ' checked' : ''}>
+            </label>
+            <label class="field" data-show="cancel"${item.cancel ? '' : ' hidden'}><span>Laufzeit bis</span>
+              <input name="termEnd" type="date" value="${esc(c.termEnd)}">
+            </label>
+            <label class="field" data-show="cancel"${item.cancel ? '' : ' hidden'}><span>Verlängert sich</span>
+              <select name="renewMonths">${RENEW_OPTIONS.map((o) => `<option value="${o.value}"${o.value === c.renewMonths ? ' selected' : ''}>${o.label}</option>`).join('')}</select>
+            </label>
+            <div class="field" data-show="cancel"${item.cancel ? '' : ' hidden'}><span>Kündigungsfrist</span>
+              <span class="combo">
+                <input name="notice" type="number" min="0" max="400" inputmode="numeric" value="${c.notice}" aria-label="Kündigungsfrist">
+                <select name="noticeUnit" aria-label="Einheit">${Object.entries(NOTICE_UNITS).map(([k, v]) => `<option value="${k}"${k === c.noticeUnit ? ' selected' : ''}>${v}</option>`).join('')}</select>
+              </span>
+            </div>
+          </div>
+          <p class="hint" data-show="cancel" id="cancel-preview"${item.cancel ? '' : ' hidden'}></p>
+        </div>
 
         <div class="fields">
           <label class="field stacked"><span>Notiz</span>
-            <textarea name="note" rows="2" maxlength="300" placeholder="Optional, z. B. Vertragsnummer oder Kündigungsfrist">${esc(item.note || '')}</textarea>
+            <textarea name="note" rows="2" maxlength="300" placeholder="Optional, z. B. Vertragsnummer">${esc(item.note || '')}</textarea>
           </label>
         </div>
 
@@ -603,7 +1000,7 @@ function openEntrySheet(id) {
 
         ${existing ? `
           <div class="sheet-actions">
-            ${isEnded(existing) ? '' : `<button type="button" class="btn" data-action="end-today" data-id="${esc(existing.id)}">Heute beenden</button>`}
+            ${isOnce(existing) || isEnded(existing) ? '' : `<button type="button" class="btn" data-action="end-today" data-id="${esc(existing.id)}">Heute beenden</button>`}
             <button type="button" class="btn danger" data-action="delete" data-id="${esc(existing.id)}">Eintrag löschen</button>
           </div>` : ''}
       </form>
@@ -615,13 +1012,67 @@ function openEntrySheet(id) {
   requestAnimationFrame(() => root.classList.add('open'));
 
   const form = $('#entry-form');
-  const show = (key, on) => form.closest('.sheet').querySelectorAll(`[data-show="${key}"]`).forEach((el) => { el.hidden = !on; });
+  const sheet = form.closest('.sheet');
+  const show = (key, on) => sheet.querySelectorAll(`[data-show="${key}"]`).forEach((el) => { el.hidden = !on; });
+  const onceSelected = () => form.interval.value === 'once';
 
-  form.interval.addEventListener('change', () => show('custom', form.interval.value === 'custom'));
+  function syncInterval() {
+    const once = onceSelected();
+    show('custom', form.interval.value === 'custom');
+    sheet.querySelectorAll('[data-recurring]').forEach((el) => {
+      el.hidden = once || (el.dataset.show === 'cancel-block' && form.hasEnd.checked);
+    });
+    sheet.querySelector('[data-label="date"]').textContent = once ? 'Datum' : 'Fällig am';
+    sheet.querySelector('[data-label="date-hint"]').textContent = once
+      ? 'Der Tag, an dem die Zahlung anfällt. Liegt er in der Zukunft, zeigt die Vorschau, wie viel du bis dahin pro Monat zurücklegen solltest.'
+      : 'Ein Tag, an dem die Zahlung fällig war oder wird. Ab da wiederholt sie sich im gewählten Rhythmus, davor rechnet die App nicht mit.';
+    const amountLabel = sheet.querySelector('[data-label="amount"]');
+    if (amountLabel) amountLabel.textContent = existing && !once ? 'Betrag aktuell' : 'Betrag';
+  }
+
+  function renderPrices() {
+    const listEl = $('#price-list');
+    if (!listEl) return;
+    listEl.innerHTML = draftPrices.map((p, i) => `
+      <li>
+        <span>ab ${D.long(p.from)}${p.from > today ? ' <em>geplant</em>' : ''}</span>
+        <b>${fmt(p.amount)}</b>
+        ${draftPrices.length > 1 ? `<button type="button" class="icon-btn small" data-local="price-del" data-index="${i}" aria-label="Preis ab ${D.long(p.from)} entfernen">${ICON.trash}</button>` : '<span class="icon-spacer"></span>'}
+      </li>`).join('');
+  }
+
+  function renderCancelPreview() {
+    const el = $('#cancel-preview');
+    if (!el || !form.hasCancel.checked) return;
+    const draft = normalizeCancel({ termEnd: form.termEnd.value, renewMonths: form.renewMonths.value, notice: form.notice.value, noticeUnit: form.noticeUnit.value });
+    if (!draft) { el.textContent = 'Trag ein, bis wann der Vertrag aktuell läuft.'; return; }
+    const info = cancellationInfo({ ...item, interval: { unit: 'month', every: 1 }, endDate: null, startDate: '1900-01-01', cancel: draft }, today);
+    if (!info) el.textContent = '';
+    else if (info.expired) el.textContent = `Der Vertrag endet am ${D.long(info.termEnd)} und verlängert sich nicht. Trag dann den letzten Tag oben ein.`;
+    else el.textContent = `Nächste Frist: bis ${D.long(info.deadline)} kündigen (${daysText(info.daysLeft)}), dann endet der Vertrag am ${D.long(info.termEnd)}.`;
+  }
+
+  syncInterval();
+  renderPrices();
+  renderCancelPreview();
+
+  form.interval.addEventListener('change', syncInterval);
   form.hasEnd.addEventListener('change', () => {
     show('end', form.hasEnd.checked);
-    if (form.hasEnd.checked && !form.endDate.value) form.endDate.value = D.today();
+    if (form.hasEnd.checked && !form.endDate.value) form.endDate.value = today;
+    syncInterval();
   });
+  form.hasCancel.addEventListener('change', () => {
+    show('cancel', form.hasCancel.checked);
+    if (form.hasCancel.checked && !form.termEnd.value) {
+      // Vorschlag: Monatsende des aktuellen Monats
+      const t = D.parse(today);
+      form.termEnd.value = D.monthEnd(t.y, t.m);
+    }
+    renderCancelPreview();
+  });
+  ['termEnd', 'renewMonths', 'notice', 'noticeUnit'].forEach((n) => form[n].addEventListener('input', renderCancelPreview));
+  ['renewMonths', 'noticeUnit'].forEach((n) => form[n].addEventListener('change', renderCancelPreview));
   form.category.addEventListener('change', () => {
     show('newcat', form.category.value === '__new');
     if (form.category.value === '__new') form.newCategory.focus();
@@ -631,45 +1082,101 @@ function openEntrySheet(id) {
     form.category.innerHTML = categoryOptions(type, state.categories[type][0]);
     show('newcat', false);
   }));
-  form.addEventListener('submit', (e) => { e.preventDefault(); submitEntry(form, existing); });
+
+  sheet.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-local]');
+    if (!btn) return;
+    const errEl = form.querySelector('.form-error');
+    errEl.textContent = '';
+    if (btn.dataset.local === 'price-open') {
+      sheet.querySelector('.price-add').hidden = false;
+      sheet.querySelector('[data-local="price-apply"]').hidden = false;
+      btn.hidden = true;
+      form.priceAmount.focus();
+    } else if (btn.dataset.local === 'price-apply') {
+      const amount = parseAmount(form.priceAmount.value);
+      const from = form.priceFrom.value;
+      if (!D.valid(from)) { errEl.textContent = 'Wähle, ab wann der neue Betrag gilt.'; return; }
+      if (!(amount > 0)) { errEl.textContent = 'Gib den neuen Betrag ein, z. B. 14,99.'; form.priceAmount.focus(); return; }
+      draftPrices = draftPrices.filter((p) => p.from !== from);
+      draftPrices.push({ from, amount });
+      draftPrices.sort((a, b) => a.from.localeCompare(b.from));
+      form.amount.value = amountToInput(priceAt({ prices: draftPrices }, today < form.startDate.value ? form.startDate.value : today));
+      form.priceAmount.value = '';
+      sheet.querySelector('.price-add').hidden = true;
+      btn.hidden = true;
+      sheet.querySelector('[data-local="price-open"]').hidden = false;
+      renderPrices();
+      toast('Preisänderung vorgemerkt, jetzt sichern');
+    } else if (btn.dataset.local === 'price-del') {
+      draftPrices.splice(Number(btn.dataset.index), 1);
+      form.amount.value = amountToInput(priceAt({ prices: draftPrices }, today < form.startDate.value ? form.startDate.value : today));
+      renderPrices();
+    }
+  });
+
+  form.addEventListener('submit', (e) => { e.preventDefault(); submitEntry(form, existing, draftPrices); });
 
   if (!existing) setTimeout(() => form.name.focus({ preventScroll: true }), 320);
 }
 
-function submitEntry(form, existing) {
+function submitEntry(form, existing, draftPrices) {
   const err = (msg, field) => {
     form.querySelector('.form-error').textContent = msg;
-    if (field) form[field].focus();
+    if (field && form[field]) form[field].focus();
   };
+  const today = D.today();
   const type = form.type.value;
   const name = form.name.value.trim();
   const amount = parseAmount(form.amount.value);
   const preset = INTERVAL_PRESETS.find((p) => p.key === form.interval.value);
   const every = preset ? preset.every : Math.round(Number(form.every.value));
   const unit = preset ? preset.unit : 'month';
+  const once = unit === 'once';
   const startDate = form.startDate.value;
-  const endDate = form.hasEnd.checked ? form.endDate.value : null;
+  const endDate = !once && form.hasEnd.checked ? form.endDate.value : null;
   let category = form.category.value;
 
   if (!name) return err('Gib einen Namen ein.', 'name');
   if (!(amount > 0)) return err('Gib einen Betrag größer als 0 ein, z. B. 12,99.', 'amount');
   if (!(every >= 1 && every <= 120)) return err('Der Rhythmus muss zwischen 1 und 120 Monaten liegen.', 'every');
-  if (!D.valid(startDate)) return err('Wähle ein Datum, an dem die Zahlung fällig ist.', 'startDate');
+  if (!D.valid(startDate)) return err(once ? 'Wähle das Datum.' : 'Wähle ein Datum, an dem die Zahlung fällig ist.', 'startDate');
   if (endDate !== null) {
     if (!D.valid(endDate)) return err('Wähle den letzten Tag.', 'endDate');
     if (endDate < startDate) return err('Der letzte Tag liegt vor dem Fälligkeitsdatum.', 'endDate');
   }
+
+  let cancel = null;
+  if (!once && !endDate && form.hasCancel.checked) {
+    cancel = normalizeCancel({ termEnd: form.termEnd.value, renewMonths: form.renewMonths.value, notice: form.notice.value, noticeUnit: form.noticeUnit.value });
+    if (!cancel) return err('Trag ein, bis wann der Vertrag läuft, oder schalte die Kündigungsfrist aus.', 'termEnd');
+  }
+
   if (category === '__new') {
     category = form.newCategory.value.trim();
     if (!category) return err('Gib einen Namen für die neue Kategorie ein.', 'newCategory');
     if (!state.categories[type].includes(category)) state.categories[type].push(category);
   }
 
+  let prices;
+  if (once || !existing || !draftPrices.length) {
+    prices = [{ from: startDate, amount }];
+  } else {
+    prices = draftPrices.map((p) => ({ ...p }));
+    const ref = today < startDate ? startDate : today;
+    let idx = -1;
+    prices.forEach((p, i) => { if (p.from <= ref) idx = i; });
+    if (idx < 0) idx = 0;
+    prices[idx].amount = amount; // „Betrag aktuell“ korrigiert den gültigen Preis
+    if (startDate < prices[0].from) prices[0].from = startDate;
+  }
+
   const now = new Date().toISOString();
-  const data = { type, name, amount, interval: { unit, every }, startDate, endDate, category, note: form.note.value.trim() };
+  const data = { type, name, prices, interval: { unit, every }, startDate, endDate, cancel, category, note: form.note.value.trim() };
 
   if (existing) {
     Object.assign(existing, data, { updatedAt: now });
+    delete existing.amount;
   } else {
     state.items.push({ id: uid(), ...data, createdAt: now, updatedAt: now });
   }
@@ -741,6 +1248,7 @@ async function importBackup(file) {
     const msg = `Backup mit ${data.items.length} ${data.items.length === 1 ? 'Eintrag' : 'Einträgen'} wiederherstellen? Die ${state.items.length} aktuellen Einträge werden dabei ersetzt.`;
     if (!confirm(msg)) return;
     state = data;
+    ui.whatIfOff.clear();
     save();
     applyTheme();
     render();
@@ -784,6 +1292,12 @@ document.addEventListener('click', (e) => {
     case 'prev-month': ui.month = D.addMonths(ui.month, -1); render(); break;
     case 'next-month': ui.month = D.addMonths(ui.month, 1); render(); break;
     case 'this-month': { const t = D.parse(D.today()); ui.month = { y: t.y, m: t.m }; render(); break; }
+    case 'goto-month':
+      ui.month = { y: Number(el.dataset.y), m: Number(el.dataset.m) };
+      ui.tab = 'overview';
+      render();
+      window.scrollTo(0, 0);
+      break;
     case 'filter': ui.entryFilter = value; render(); break;
     case 'theme': state.settings.theme = value; save(); applyTheme(); render(); break;
     case 'export': exportBackup(); break;
@@ -794,6 +1308,7 @@ document.addEventListener('click', (e) => {
       if (!item) break;
       const today = D.today();
       item.endDate = today < item.startDate ? item.startDate : today;
+      item.cancel = null;
       item.updatedAt = new Date().toISOString();
       save(); closeSheet(); render();
       toast(`„${item.name}“ beendet`);
@@ -803,8 +1318,10 @@ document.addEventListener('click', (e) => {
     case 'delete': {
       const item = state.items.find((i) => i.id === id);
       if (!item) break;
-      if (!confirm(`„${item.name}“ endgültig löschen?\n\nDer Eintrag verschwindet auch aus vergangenen Monaten. Wenn du gekündigt hast, trag lieber einen letzten Tag ein.`)) break;
+      const hint = isOnce(item) ? '' : '\n\nDer Eintrag verschwindet auch aus vergangenen Monaten. Wenn du gekündigt hast, trag lieber einen letzten Tag ein.';
+      if (!confirm(`„${item.name}“ endgültig löschen?${hint}`)) break;
       state.items = state.items.filter((i) => i.id !== id);
+      ui.whatIfOff.delete(id);
       save(); closeSheet(); render();
       toast(`„${item.name}“ gelöscht`);
       break;
@@ -825,6 +1342,7 @@ document.addEventListener('click', (e) => {
     case 'wipe': {
       if (!confirm('Wirklich alle Einträge und Einstellungen löschen? Das lässt sich nur mit einem Backup rückgängig machen.')) break;
       state = defaultState();
+      ui.whatIfOff.clear();
       save(); applyTheme(); render();
       toast('Alle Daten gelöscht');
       break;
@@ -836,6 +1354,14 @@ document.addEventListener('change', (e) => {
   if (e.target.id === 'import-file' && e.target.files[0]) {
     importBackup(e.target.files[0]);
     e.target.value = '';
+    return;
+  }
+  if (e.target.dataset && e.target.dataset.action === 'whatif') {
+    const id = e.target.dataset.id;
+    if (e.target.checked) ui.whatIfOff.delete(id); else ui.whatIfOff.add(id);
+    const y = window.scrollY;
+    render();
+    window.scrollTo(0, y);
   }
 });
 
@@ -880,4 +1406,7 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 }
 
 // Für Tests und Fehlersuche
-window.__monatsausgaben = { D, monthSummary, occurrencesInMonth, monthlyAverage, nextOccurrence, migrate, parseAmount, get state() { return state; } };
+window.__monatsausgaben = {
+  D, monthSummary, occurrencesInMonth, monthlyAverage, nextOccurrence, priceAt, cancellationInfo, reserveRows, paymentsBetween,
+  migrate, parseAmount, get state() { return state; }
+};
