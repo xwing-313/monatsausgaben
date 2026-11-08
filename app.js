@@ -4,12 +4,15 @@
 
 /* ---------- Konstanten ---------- */
 
-const APP_VERSION = '1.1.0';
-const SCHEMA_VERSION = 2;          // Bei Änderungen am Datenformat erhöhen und unten eine Migration ergänzen
+const APP_VERSION = '1.2.0';
+const SCHEMA_VERSION = 3;          // Bei Änderungen am Datenformat erhöhen und unten eine Migration ergänzen
 const STORAGE_KEY = 'monatsausgaben';
 const BACKUP_REMINDER_DAYS = 30;
 const UPCOMING_DAYS = 30;
 const DEADLINE_WARN_DAYS = 30;
+const DEFAULT_FOOD_BUDGET = 290;   // Essen und Trinken pro Monat, aus der Kontoauswertung
+const BOOK_WINDOW_DAYS = 5;        // Zahlungen rund um den Kontostand, bei denen man „schon gebucht“ umschalten kann
+const PLAN_MONTHS = 13;            // So weit rechnet die App den Kontostand voraus
 
 const DEFAULT_CATEGORIES = {
   expense: ['Wohnen', 'Versicherungen', 'Abos & Medien', 'Telefon & Internet', 'Mobilität', 'Sport & Freizeit', 'Sparen & Vorsorge', 'Anschaffungen', 'Sonstiges'],
@@ -39,6 +42,7 @@ const NOTICE_UNITS = { days: 'Tage', weeks: 'Wochen', months: 'Monate' };
 
 const MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
 const MONTH_INITIALS = ['J', 'F', 'M', 'A', 'M', 'J', 'J', 'A', 'S', 'O', 'N', 'D'];
+const MONTHS_SHORT = ['Jan', 'Feb', 'März', 'Apr', 'Mai', 'Juni', 'Juli', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
 const WEEKDAYS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
 
 /* Migrationen: MIGRATIONS[n] wandelt Daten von Schema n in Schema n+1 um. */
@@ -48,6 +52,21 @@ const MIGRATIONS = {
     (d.items || []).forEach((i) => {
       if (i && !Array.isArray(i.prices) && i.amount != null) i.prices = [{ from: i.startDate, amount: Number(i.amount) }];
       if (i) delete i.amount;
+    });
+  },
+  // 2 → 3: Kontostand, Essensbudget, Puffer und der Schalter „zählt für den Folgemonat“.
+  // Gehalt und Miete in der zweiten Monatshälfte zählen ab jetzt automatisch für den Folgemonat.
+  2: (d) => {
+    d.settings = d.settings || {};
+    if (d.settings.foodBudget == null) d.settings.foodBudget = DEFAULT_FOOD_BUDGET;
+    if (d.settings.buffer == null) d.settings.buffer = 0;
+    if (d.settings.balance === undefined) d.settings.balance = null;
+    (d.items || []).forEach((i) => {
+      if (!i || typeof i.nextMonth === 'boolean') return;
+      const day = D.valid(i.startDate) ? D.parse(i.startDate).d : 1;
+      const salary = i.type === 'income' && i.category === 'Gehalt';
+      const rent = i.type !== 'income' && /miete/i.test(i.name || '');
+      i.nextMonth = (salary || rent) && day >= 15 && (i.interval || {}).unit !== 'once';
     });
   }
 };
@@ -86,8 +105,9 @@ const D = {
 const round2 = (n) => Math.round(n * 100) / 100;
 const money = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' });
 const moneyRound = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 });
-const fmt = (n) => money.format(round2(n) + 0);
-const fmt0 = (n) => moneyRound.format(Math.round(n) + 0);
+const minus = (t) => t.replace(/^-/, '−'); // echtes Minuszeichen statt Bindestrich
+const fmt = (n) => minus(money.format(round2(n) + 0));
+const fmt0 = (n) => minus(moneyRound.format(Math.round(n) + 0));
 
 /* ---------- Rechenlogik ---------- */
 
@@ -107,6 +127,23 @@ function priceAt(item, date) {
     if (pr.from <= date) p = pr.amount; else break;
   }
   return p;
+}
+
+/** Betrag einer einzelnen Zahlung: eine Ausnahme für genau diesen Termin geht vor dem Preisverlauf */
+function paymentAmount(item, date) {
+  const o = item.overrides;
+  if (o && Object.prototype.hasOwnProperty.call(o, date)) return o[date];
+  return priceAt(item, date);
+}
+
+const hasOverride = (item, date) => !!item.overrides && Object.prototype.hasOwnProperty.call(item.overrides, date);
+const signed = (p) => (p.item.type === 'income' ? p.amount : -p.amount);
+const payKey = (p) => `${p.item.id}@${p.date}`;
+
+/** Zu welchem Monat eine Zahlung im Budget gehört. „Zählt für den Folgemonat“ schiebt sie einen Monat weiter. */
+function budgetMonth(item, date) {
+  const p = D.parse(date);
+  return item.nextMonth ? D.addMonths(p, 1) : { y: p.y, m: p.m };
 }
 
 /** Durchschnitt pro Monat (Quartal ÷ 3, Jahr ÷ 12, Woche × 52,18 ÷ 12). Einmalige Posten zählen nicht. */
@@ -182,11 +219,22 @@ function paymentsBetween(fromDate, toDate, items = state.items) {
     const ym = D.addMonths(a, k);
     for (const item of items) {
       for (const date of occurrencesInMonth(item, ym.y, ym.m)) {
-        if (date >= fromDate && date <= toDate) out.push({ item, date, amount: priceAt(item, date) });
+        if (date >= fromDate && date <= toDate) out.push({ item, date, amount: paymentAmount(item, date) });
       }
     }
   }
   return out.sort((x, y) => x.date.localeCompare(y.date) || y.amount - x.amount);
+}
+
+/** Alle Zahlungen, die im Budget zum Monat y/m gehören (inklusive „zählt für den Folgemonat“ aus dem Vormonat) */
+function budgetPayments(y, m, items = state.items) {
+  const prev = D.addMonths({ y, m }, -1);
+  const out = [];
+  for (const item of items) {
+    const src = item.nextMonth ? prev : { y, m };
+    for (const date of occurrencesInMonth(item, src.y, src.m)) out.push({ item, date, amount: paymentAmount(item, date) });
+  }
+  return out.sort((a, b) => a.date.localeCompare(b.date) || b.amount - a.amount);
 }
 
 function monthSummary(y, m, items = state.items) {
@@ -194,7 +242,7 @@ function monthSummary(y, m, items = state.items) {
     avg: { income: 0, expense: 0 },
     actual: { income: 0, expense: 0 },
     once: { income: 0, expense: 0 },
-    payments: [],
+    payments: budgetPayments(y, m, items),
     categories: {}
   };
   const ref = D.monthEnd(y, m);
@@ -204,15 +252,116 @@ function monthSummary(y, m, items = state.items) {
       res.avg[item.type] += avg;
       if (item.type === 'expense') res.categories[item.category] = (res.categories[item.category] || 0) + avg;
     }
-    for (const date of occurrencesInMonth(item, y, m)) {
-      const amount = priceAt(item, date);
-      res.actual[item.type] += amount;
-      if (isOnce(item)) res.once[item.type] += amount;
-      res.payments.push({ item, date, amount });
-    }
   }
-  res.payments.sort((a, b) => a.date.localeCompare(b.date) || b.amount - a.amount);
+  for (const p of res.payments) {
+    res.actual[p.item.type] += p.amount;
+    if (isOnce(p.item)) res.once[p.item.type] += p.amount;
+  }
   return res;
+}
+
+/* ---------- Kontostand vorausrechnen ---------- */
+
+const dailyFood = (date) => {
+  const p = D.parse(date);
+  return (state.settings.foodBudget || 0) / D.dim(p.y, p.m);
+};
+
+/** Ist eine Zahlung schon im eingetragenen Kontostand enthalten? Standard: alles bis einschließlich zum Stichtag. */
+function isBooked(p, balance = state.settings.balance) {
+  if (!balance) return false;
+  const k = payKey(p);
+  if (balance.booked && Object.prototype.hasOwnProperty.call(balance.booked, k)) return balance.booked[k];
+  return p.date <= balance.date;
+}
+
+/**
+ * Rechnet ab dem Kontostand Tag für Tag weiter.
+ * Liefert den Kontostand je Tag und für jeden Budgetmonat: Startbetrag, Einnahmen, Ausgaben, Essen, Rest, tiefsten Stand, Spielraum.
+ */
+function buildPlan(untilYm) {
+  const bal = state.settings.balance;
+  if (!bal) return null;
+  const A = D.parse(bal.date);
+  const anchorYm = { y: A.y, m: A.m };
+  let last = D.addMonths(anchorYm, PLAN_MONTHS);
+  if (untilYm && D.mi(untilYm.y, untilYm.m) > D.mi(last.y, last.m)) last = untilYm;
+  const horizon = D.monthEnd(last.y, last.m);
+  const startScan = D.iso(D.addMonths(anchorYm, -1).y, D.addMonths(anchorYm, -1).m, 1);
+
+  // Alle Zahlungen mit Budgetmonat und Status
+  const events = paymentsBetween(startScan, horizon).map((p) => {
+    const booked = isBooked(p, bal);
+    return { ...p, booked, bm: budgetMonth(p.item, p.date), eff: booked ? p.date : (p.date <= bal.date ? D.addDays(bal.date, 1) : p.date) };
+  });
+
+  // Kontostand am Ende jedes Tages
+  const delta = new Map();
+  for (const e of events) if (!e.booked) delta.set(e.eff, (delta.get(e.eff) || 0) + signed(e));
+  const daily = new Map([[bal.date, bal.amount]]);
+  let run = bal.amount;
+  for (let d = D.addDays(bal.date, 1); d <= horizon; d = D.addDays(d, 1)) {
+    run += (delta.get(d) || 0) - dailyFood(d);
+    daily.set(d, run);
+  }
+
+  // Budgetmonate ab dem Monat des Kontostands
+  const months = new Map();
+  const ai = D.mi(A.y, A.m);
+  let prevEnd = null;
+  for (let ym = anchorYm; D.mi(ym.y, ym.m) <= D.mi(last.y, last.m); ym = D.addMonths(ym, 1)) {
+    const mi = D.mi(ym.y, ym.m);
+    const first = D.iso(ym.y, ym.m, 1);
+    const lastDay = D.monthEnd(ym.y, ym.m);
+    let start;
+    let carry = 0;
+    let items;
+    let foodDays;
+    if (mi === ai) {
+      // Was schon auf dem Konto ist, aber zu einem späteren Monat gehört (z. B. Gehalt für den Folgemonat)
+      carry = events.filter((e) => e.booked && D.mi(e.bm.y, e.bm.m) > ai).reduce((s, e) => s + signed(e), 0);
+      start = bal.amount - carry;
+      items = events.filter((e) => !e.booked && D.mi(e.bm.y, e.bm.m) <= ai);
+      foodDays = D.dim(ym.y, ym.m) - A.d;
+    } else {
+      start = prevEnd;
+      items = events.filter((e) => D.mi(e.bm.y, e.bm.m) === mi);
+      foodDays = D.dim(ym.y, ym.m);
+    }
+    const income = items.filter((e) => e.item.type === 'income').reduce((s, e) => s + e.amount, 0);
+    const fixed = items.filter((e) => e.item.type === 'expense' && !isOnce(e.item)).reduce((s, e) => s + e.amount, 0);
+    const once = items.filter((e) => e.item.type === 'expense' && isOnce(e.item)).reduce((s, e) => s + e.amount, 0);
+    const food = (state.settings.foodBudget || 0) * foodDays / D.dim(ym.y, ym.m);
+    const end = start + income - fixed - once - food;
+
+    // Tiefster tatsächlicher Kontostand in diesem Kalendermonat
+    let low = null;
+    for (let d = first < bal.date ? bal.date : first; d <= lastDay; d = D.addDays(d, 1)) {
+      const v = daily.get(d);
+      if (v !== undefined && (low === null || v < low.value - 0.004)) low = { value: v, date: d };
+    }
+    // Engste Stelle dieses Monats: tiefster Tagesstand oder der Rest am Monatsende (ohne Gehalt für den Folgemonat)
+    const tight = low && low.value < end ? { value: low.value, date: low.date } : { value: end, date: lastDay };
+    months.set(mi, { ...ym, start, carry, items, income, fixed, once, food, foodDays, end, low, tight, isAnchor: mi === ai });
+    prevEnd = end;
+  }
+
+  // Spielraum: was du in einem Monat ausgibst, fehlt auch in allen späteren. Deshalb zählt die engste Stelle ab diesem Monat.
+  const buffer = state.settings.buffer || 0;
+  let bind = null;
+  for (const mi of [...months.keys()].sort((a, b) => b - a)) {
+    const mo = months.get(mi);
+    if (!bind || mo.tight.value <= bind.value + 0.004) bind = { ...mo.tight, y: mo.y, m: mo.m };
+    mo.bind = bind;
+    mo.room = bind.value - buffer;
+  }
+
+  return {
+    balance: bal,
+    events,
+    daily,
+    month: (y, m) => months.get(D.mi(y, m)) || null
+  };
 }
 
 /** Kündigungsfrist: nächstes mögliches Vertragsende und der Tag, bis zu dem gekündigt sein muss */
@@ -252,7 +401,7 @@ function reserveRows(today = D.today()) {
     const prev = D.shiftMonths(next, -item.interval.every);
     const span = D.num(next) - D.num(prev);
     const share = Math.min(1, Math.max(0, (D.num(today) - D.num(prev)) / span));
-    const amount = priceAt(item, next);
+    const amount = paymentAmount(item, next);
     rows.push({ item, kind: 'recurring', next, amount, perMonth: amount / item.interval.every, target: item.startDate > today ? 0 : amount * share });
   }
   return rows.sort((a, b) => a.next.localeCompare(b.next));
@@ -270,7 +419,7 @@ function defaultState() {
     schemaVersion: SCHEMA_VERSION,
     items: [],
     categories: JSON.parse(JSON.stringify(DEFAULT_CATEGORIES)),
-    settings: { theme: 'system', lastBackupAt: null }
+    settings: { theme: 'system', lastBackupAt: null, foodBudget: DEFAULT_FOOD_BUDGET, buffer: 0, balance: null }
   };
 }
 
@@ -315,10 +464,35 @@ function normalizeItem(raw) {
     endDate: iv.unit !== 'once' && D.valid(raw.endDate) && raw.endDate >= raw.startDate ? raw.endDate : null,
     cancel: iv.unit === 'once' ? null : normalizeCancel(raw.cancel),
     category: typeof raw.category === 'string' && raw.category ? raw.category : 'Sonstiges',
-    note: typeof raw.note === 'string' ? raw.note.slice(0, 300) : ''
+    note: typeof raw.note === 'string' ? raw.note.slice(0, 300) : '',
+    nextMonth: raw.nextMonth === true,
+    overrides: normalizeOverrides(raw.overrides, iv.unit)
   };
   delete out.amount;
+  if (!out.overrides) delete out.overrides;
   return out;
+}
+
+/** Einzelne Zahlungen mit abweichendem Betrag: { "2026-11-27": 1200 }. 0 heißt „fällt diesmal aus“. */
+function normalizeOverrides(o, unit) {
+  if (unit === 'once' || !o || typeof o !== 'object') return null;
+  const out = {};
+  for (const [date, val] of Object.entries(o)) {
+    const n = Number(val);
+    if (D.valid(date) && Number.isFinite(n) && n >= 0) out[date] = round2(n);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function normalizeBalance(b) {
+  if (!b || typeof b !== 'object' || !D.valid(b.date)) return null;
+  const amount = Number(b.amount);
+  if (!Number.isFinite(amount)) return null;
+  const booked = {};
+  if (b.booked && typeof b.booked === 'object') {
+    for (const [k, v] of Object.entries(b.booked)) if (typeof v === 'boolean' && /@\d{4}-\d{2}-\d{2}$/.test(k)) booked[k] = v;
+  }
+  return { amount: round2(amount), date: b.date, booked };
 }
 
 function normalize(d) {
@@ -330,7 +504,18 @@ function normalize(d) {
     schemaVersion: SCHEMA_VERSION,
     items: Array.isArray(d.items) ? d.items.map(normalizeItem).filter(Boolean) : [],
     categories: { expense: list(cats.expense, base.categories.expense), income: list(cats.income, base.categories.income) },
-    settings: { ...base.settings, ...(d.settings || {}) }
+    settings: normalizeSettings({ ...base.settings, ...(d.settings || {}) })
+  };
+}
+
+function normalizeSettings(st) {
+  const money = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? round2(Number(v)) : fallback);
+  return {
+    ...st,
+    theme: ['system', 'light', 'dark'].includes(st.theme) ? st.theme : 'system',
+    foodBudget: money(st.foodBudget, DEFAULT_FOOD_BUDGET),
+    buffer: money(st.buffer, 0),
+    balance: normalizeBalance(st.balance)
   };
 }
 
@@ -430,7 +615,8 @@ const ICON = {
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   share: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3M7 8l5-5 5 5M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg>',
   restore: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-7"/></svg>',
-  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>'
+  trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4zM13.5 6.5l4 4"/></svg>'
 };
 
 /** Takt-Leiste: zeigt für die nächsten 12 Monate, in welchen Monaten gezahlt wird */
@@ -468,26 +654,44 @@ function emptyState(text, button = 'Ersten Eintrag anlegen') {
     </section>`;
 }
 
-function payRow(p, showWeekday = false) {
+function payRow(p, opts = {}) {
+  const { showWeekday = false, viewYm = null, balance, booked = false } = opts;
   const once = isOnce(p.item);
-  const day = D.parse(p.date).d;
+  const pd = D.parse(p.date);
+  const foreign = viewYm && (pd.y !== viewYm.y || pd.m !== viewYm.m);
+  const top = showWeekday ? D.weekday(p.date) : foreign ? MONTHS_SHORT[pd.m - 1] : '';
+  const sub = [once ? 'einmalig' : intervalLabel(p.item.interval)];
+  if (showWeekday) sub.push(D.short(p.date));
+  if (hasOverride(p.item, p.date)) sub.push('angepasst');
+  if (booked) sub.push('schon gebucht');
+  const stand = balance === undefined ? '' : `<small class="${balance < 0 ? 'neg' : ''}">Stand ${fmt0(balance)}</small>`;
   return `
     <li>
-      <button class="pay" type="button" data-action="edit" data-id="${esc(p.item.id)}">
-        <span class="pay-date">${showWeekday ? `<small>${D.weekday(p.date)}</small>` : ''}<b>${day}.</b></span>
-        <span class="pay-text"><span class="pay-name">${esc(p.item.name)}</span><small>${once ? 'einmalig' : esc(intervalLabel(p.item.interval))}${showWeekday ? `, ${D.short(p.date)}` : ''}</small></span>
-        <span class="pay-amount ${p.item.type}">${p.item.type === 'income' ? '+' : '−'}${fmt(p.amount)}</span>
+      <button class="pay${booked ? ' booked' : ''}" type="button" data-action="pay" data-id="${esc(p.item.id)}" data-date="${p.date}">
+        <span class="pay-date">${top ? `<small>${top}</small>` : ''}<b>${pd.d}.</b></span>
+        <span class="pay-text"><span class="pay-name">${esc(p.item.name)}</span><small>${esc(sub.join(', '))}</small></span>
+        <span class="pay-right"><span class="pay-amount ${p.item.type}">${p.item.type === 'income' ? '+' : '−'}${fmt(p.amount)}</span>${stand}</span>
       </button>
     </li>`;
 }
 
 /* ---------- Ansicht: Übersicht ---------- */
 
+function flowRow(label, value, { sign = '', sub = '', cls = '' } = {}) {
+  return `
+    <li class="flow-row ${cls}">
+      <span>${label}${sub ? `<small>${sub}</small>` : ''}</span>
+      <b class="${value < -0.004 && !sign ? 'neg' : ''}">${sign}${fmt(Math.abs(value) < 0.005 ? 0 : sign ? Math.abs(value) : value)}</b>
+    </li>`;
+}
+
 function renderOverview() {
   const { y, m } = ui.month;
   const monthName = MONTHS[m - 1];
   const today = D.parse(D.today());
   const isCurrent = today.y === y && today.m === m;
+  const bal = state.settings.balance;
+  const food = state.settings.foodBudget || 0;
 
   const header = `
     <header class="topbar">
@@ -502,72 +706,122 @@ function renderOverview() {
       <button class="add-btn" type="button" data-action="add" aria-label="Eintrag hinzufügen">${ICON.plus}</button>
     </header>`;
 
-  if (state.items.length === 0) {
-    return header + emptyState('Trag deine wiederkehrenden Ausgaben und Einnahmen ein, egal ob monatlich, vierteljährlich oder jährlich. Die App rechnet aus, was dich ein Monat im Schnitt kostet und was wirklich abgebucht wird.');
+  if (state.items.length === 0 && !bal) {
+    return header + emptyState('Trag deine wiederkehrenden Ausgaben und Einnahmen ein, egal ob monatlich, vierteljährlich oder jährlich. Mit deinem Kontostand rechnet die App dann aus, wie viel dir in jedem Monat bleibt.');
   }
 
-  const s = monthSummary(y, m);
-  const netAvg = s.avg.income - s.avg.expense;
-  const netAct = s.actual.income - s.actual.expense;
-  const diff = s.actual.expense - s.avg.expense;
+  const plan = buildPlan(D.addMonths({ y, m }, 12));
+  const mo = plan ? plan.month(y, m) : null;
+  const prevName = MONTHS[D.addMonths({ y, m }, -1).m - 1];
+  const nextName = MONTHS[D.addMonths({ y, m }, 1).m - 1];
 
-  const rareNames = [...new Set(s.payments.filter((p) => p.item.type === 'expense' && !isMonthly(p.item) && !isOnce(p.item)).map((p) => p.item.name))];
-  const onceNames = [...new Set(s.payments.filter((p) => p.item.type === 'expense' && isOnce(p.item)).map((p) => p.item.name))];
-  const dueParts = [];
-  if (rareNames.length) dueParts.push(listJoin(rareNames));
-  if (onceNames.length) dueParts.push(`einmalig ${listJoin(onceNames)}`);
+  const balanceRow = bal ? `
+    <button class="balance-row" type="button" data-action="balance">
+      <span>Kontostand am ${D.long(bal.date)}</span>
+      <b class="${bal.amount < 0 ? 'neg' : ''}">${fmt(bal.amount)}</b>
+      ${ICON.edit}
+    </button>` : '';
 
-  let note;
-  if (Math.abs(diff) < 0.5) {
-    note = `Im ${monthName} wird genau so viel abgebucht wie im Schnitt.`;
-  } else if (diff > 0) {
-    const verb = rareNames.length + onceNames.length === 1 ? 'wird' : 'werden';
-    note = `Im ${monthName} zahlst du <b>${fmt(diff)} mehr</b> als im Schnitt.${dueParts.length ? ` Fällig ${verb} ${esc(dueParts.join(', außerdem '))}.` : ''}`;
+  let hero = '';
+  let flow = '';
+  let notes = [];
+  let rows = [];
+
+  if (mo) {
+    // Spielraum
+    let text;
+    const buffer = state.settings.buffer || 0;
+    const b = mo.bind;
+    const here = b.y === y && b.m === m;
+    const bName = `${MONTHS[b.m - 1]}${b.y !== y ? ` ${b.y}` : ''}`;
+    const isEnd = b.date === D.monthEnd(b.y, b.m);
+    const limit = buffer > 0 ? `unter deinen Puffer von ${fmt0(buffer)}` : 'ins Minus';
+    if (mo.room >= -0.5) {
+      text = `So viel kannst du im ${monthName} noch zusätzlich ausgeben, ohne dass dein Konto ${limit} rutscht. Am knappsten wird es ${isEnd ? `Ende ${bName}` : `am ${D.short(b.date)}${here ? '' : ` (${bName})`}`}.`;
+    } else if (here && !isEnd) {
+      text = `Am ${D.short(b.date)} rutscht dein Konto ${buffer > 0 ? limit : `auf ${fmt0(b.value)}`}. So viel muss bis dahin dazukommen oder eine Ausgabe warten.`;
+    } else if (here) {
+      text = `So viel fehlt dir bis Ende ${monthName}, das Gehalt für den ${nextName} nicht mitgerechnet.`;
+    } else {
+      text = `Im ${bName} fehlen dir ${fmt0(-mo.room)}. Was du im ${monthName} ausgibst, fehlt dort zusätzlich.`;
+    }
+    const jump = here ? '' : `<button class="link room-link" type="button" data-action="goto-month" data-y="${b.y}" data-m="${b.m}">Zum ${MONTHS[b.m - 1]}</button>`;
+    hero = `
+      <section class="room${mo.room < -0.5 ? ' is-neg' : ''}" aria-label="Spielraum">
+        <span class="room-label">Spielraum im ${monthName}</span>
+        <b class="room-value">${fmt0(Math.abs(mo.room) < 0.5 ? 0 : mo.room)}</b>
+        <p>${text}</p>
+        ${jump}
+      </section>`;
+
+    // Rechnung
+    const parts = [];
+    parts.push(mo.isAnchor
+      ? flowRow(`Kontostand am ${D.short(bal.date)}`, bal.amount)
+      : flowRow(`Rest aus dem ${prevName}`, mo.start));
+    if (mo.isAnchor && Math.abs(mo.carry) >= 0.005) {
+      parts.push(flowRow(`Davon schon für den ${nextName}`, mo.carry, { sign: mo.carry > 0 ? '− ' : '+ ', sub: 'eingegangen, zählt erst dann' }));
+    }
+    parts.push(flowRow('Einnahmen', mo.income, { sign: '+ ' }));
+    parts.push(flowRow('Feste Ausgaben', mo.fixed, { sign: '− ' }));
+    if (mo.once > 0.004) parts.push(flowRow('Einmalig', mo.once, { sign: '− ' }));
+    if (food > 0) parts.push(flowRow('Essen', mo.food, { sign: '− ', sub: mo.isAnchor ? `noch ${mo.foodDays} ${mo.foodDays === 1 ? 'Tag' : 'Tage'}` : '' }));
+    parts.push(flowRow(`Rest Ende ${monthName}`, mo.end, { cls: 'flow-total' }));
+    const low = mo.low ? `<p class="flow-low">Tiefster Kontostand <b class="${mo.low.value < 0 ? 'neg' : ''}">${fmt0(mo.low.value)}</b> am ${D.short(mo.low.date)}</p>` : '';
+    flow = `<section class="block flow-block"><ul class="flow">${parts.join('')}</ul>${low}</section>`;
+
+    // Hinweise
+    const shifted = mo.items.filter((e) => e.item.nextMonth && (D.parse(e.date).m !== m));
+    const shiftedNames = [...new Set(shifted.map((e) => `${e.item.name} (${D.short(e.date)})`))];
+    if (shiftedNames.length) notes.push(`${esc(listJoin(shiftedNames))} ${shiftedNames.length === 1 ? 'zählt' : 'zählen'} schon für den ${monthName}.`);
+
+    // Zahlungsliste
+    if (mo.isAnchor) {
+      const bookedHere = budgetPayments(y, m).filter((p) => isBooked(p, bal)).map((p) => ({ p, booked: true }));
+      rows = [...bookedHere, ...mo.items.map((e) => ({ p: e, booked: false }))];
+    } else {
+      rows = mo.items.map((e) => ({ p: e, booked: e.booked }));
+    }
+    rows.sort((a, b) => a.p.date.localeCompare(b.p.date) || b.p.amount - a.p.amount);
+    rows = rows.map(({ p, booked }) => payRow(p, { viewYm: { y, m }, booked, balance: booked ? undefined : plan.daily.get(p.eff) }));
   } else {
-    note = `Im ${monthName} zahlst du <b>${fmt(-diff)} weniger</b> als im Schnitt, weil seltenere Zahlungen diesmal nicht fällig sind.`;
+    // Ohne Kontostand oder vor dem Kontostand: nur die Zahlungen des Monats
+    const s = monthSummary(y, m);
+    const before = !!bal;
+    if (before) {
+      hero = `<p class="room-past">Für Monate vor deinem Kontostand vom ${D.long(bal.date)} rechnet die App keinen Kontostand. Hier siehst du nur, was gezahlt wurde.</p>`;
+    } else {
+      hero = `
+        <section class="room room-empty">
+          <span class="room-label">Wie viel bleibt dir?</span>
+          <p>Trag deinen aktuellen Kontostand ein. Dann rechnet die App mit allen Zahlungen und deinem Essensbudget aus, wie viel du in jedem Monat noch ausgeben kannst.</p>
+          <button class="btn primary" type="button" data-action="balance">Kontostand eintragen</button>
+        </section>`;
+    }
+    const fixed = s.actual.expense - s.once.expense;
+    const net = s.actual.income - s.actual.expense - (before ? 0 : food);
+    const parts = [
+      flowRow('Einnahmen', s.actual.income, { sign: '+ ' }),
+      flowRow('Feste Ausgaben', fixed, { sign: '− ' })
+    ];
+    if (s.once.expense > 0.004) parts.push(flowRow('Einmalig', s.once.expense, { sign: '− ' }));
+    if (!before && food > 0) parts.push(flowRow('Essen', food, { sign: '− ' }));
+    parts.push(flowRow(net >= 0 ? 'Bleibt übrig' : 'Fehlt', net, { cls: 'flow-total' }));
+    flow = `<section class="block flow-block"><ul class="flow">${parts.join('')}</ul></section>`;
+    rows = s.payments.map((p) => payRow(p, { viewYm: { y, m } }));
   }
-  if (s.once.expense || s.once.income) note += ' Einmalige Posten zählen nur in ihrem Monat, nicht im Schnitt.';
-
-  const payments = s.payments.length
-    ? s.payments.map((p) => payRow(p)).join('')
-    : '<li class="muted-row">In diesem Monat ist keine Zahlung fällig.</li>';
-
-  const cats = Object.entries(s.categories).sort((a, b) => b[1] - a[1]);
-  const maxCat = cats.length ? cats[0][1] : 1;
-  const catHtml = cats.length
-    ? cats.map(([name, val]) => `
-        <li class="cat">
-          <div class="cat-top"><span>${esc(name)}</span><span>${fmt(val)}</span></div>
-          <div class="cat-bar"><i style="width:${Math.max(2, (val / maxCat) * 100).toFixed(1)}%"></i></div>
-        </li>`).join('')
-    : '<li class="muted-row">Keine laufenden Ausgaben in diesem Monat.</li>';
 
   return header + `
     ${backupReminder()}
-    <section class="ledger" aria-label="Monatsbilanz">
-      <div class="ledger-row ledger-head">
-        <span></span><span>Im Schnitt</span><span>Im ${monthName}</span>
-      </div>
-      <div class="ledger-row out">
-        <span>Ausgaben</span><b>${fmt(s.avg.expense)}</b><b>${fmt(s.actual.expense)}</b>
-      </div>
-      <div class="ledger-row in">
-        <span>Einnahmen</span><b>${fmt(s.avg.income)}</b><b>${fmt(s.actual.income)}</b>
-      </div>
-      <div class="ledger-row net">
-        <span>Übrig</span><b class="${netAvg < 0 ? 'neg' : ''}">${fmt(netAvg)}</b><b class="${netAct < 0 ? 'neg' : ''}">${fmt(netAct)}</b>
-      </div>
-    </section>
-    <p class="ledger-note">${note}</p>
+    ${balanceRow}
+    ${hero}
+    ${flow}
+    ${notes.length ? `<p class="ledger-note">${notes.join(' ')}</p>` : ''}
 
     <section class="block">
       <h2>Zahlungen im ${monthName}</h2>
-      <ul class="pay-list">${payments}</ul>
-    </section>
-
-    <section class="block">
-      <h2>Ausgaben nach Kategorie <small>im Schnitt pro Monat</small></h2>
-      <ul class="cat-list">${catHtml}</ul>
+      <ul class="pay-list">${rows.length ? rows.join('') : '<li class="muted-row">In diesem Monat ist keine Zahlung fällig.</li>'}</ul>
+      ${mo && food > 0 && rows.length ? `<p class="hint">Der Stand je Zahlung enthält schon das Essensbudget, verteilt auf die Tage.</p>` : ''}
     </section>`;
 }
 
@@ -611,7 +865,7 @@ function renderPlan() {
     </li>`).join('');
 
   const upcomingHtml = upcoming.length
-    ? upcoming.map((p) => payRow(p, true)).join('')
+    ? upcoming.map((p) => payRow(p, { showWeekday: true })).join('')
     : '<li class="muted-row">In den nächsten 30 Tagen ist nichts fällig.</li>';
 
   // 12 Monate
@@ -766,7 +1020,7 @@ function entryRow(item, today, from) {
           <span class="entry-amount ${item.type}">${item.type === 'income' ? '+' : ''}${fmt(price)}</span>
         </span>
         <span class="entry-sub">
-          <span>${esc(item.category)}, ${isOnce(item) ? 'einmalig' : esc(intervalLabel(item.interval))}</span>
+          <span>${esc(item.category)}, ${isOnce(item) ? 'einmalig' : esc(intervalLabel(item.interval))}${item.nextMonth ? ', für Folgemonat' : ''}</span>
           ${right ? `<span>${right}</span>` : ''}
         </span>
         <span class="entry-foot">
@@ -824,8 +1078,26 @@ function renderSettings() {
   const catList = (type) => state.categories[type].map((c) => `
       <li><span>${esc(c)}</span><button class="icon-btn small" type="button" data-action="delete-category" data-type="${type}" data-value="${esc(c)}" aria-label="Kategorie ${esc(c)} entfernen">${ICON.trash}</button></li>`).join('');
 
+  const st = state.settings;
   return topbar('Einstellungen', false) + `
     <section class="block first">
+      <h2>Planung</h2>
+      <div class="fields">
+        <label class="field"><span>Essen pro Monat</span>
+          <span class="money-input"><input data-setting="foodBudget" inputmode="decimal" autocomplete="off" value="${amountToInput(st.foodBudget)}"><em>€</em></span>
+        </label>
+        <label class="field"><span>Puffer</span>
+          <span class="money-input"><input data-setting="buffer" inputmode="decimal" autocomplete="off" value="${amountToInput(st.buffer)}"><em>€</em></span>
+        </label>
+        <button class="field field-link" type="button" data-action="balance">
+          <span>Kontostand</span>
+          <span>${st.balance ? `${fmt(st.balance.amount)} am ${D.short(st.balance.date)}` : 'eintragen'}</span>
+        </button>
+      </div>
+      <p class="hint">Das Essensbudget verteilt die App gleichmäßig auf die Tage. Der Puffer bleibt immer auf dem Konto, der Spielraum zählt erst darüber.</p>
+    </section>
+
+    <section class="block">
       <h2>Datensicherung</h2>
       <p class="block-text">Deine Daten liegen nur auf diesem iPhone. Sichere sie regelmäßig als Datei, zum Beispiel in iCloud Drive über „In Dateien sichern“.</p>
       <div class="action-list">
@@ -889,7 +1161,7 @@ function openEntrySheet(id) {
   const existing = id ? state.items.find((i) => i.id === id) : null;
   const item = existing || {
     type: 'expense', name: '', prices: null, interval: { unit: 'month', every: 1 },
-    startDate: today, endDate: null, cancel: null, category: state.categories.expense[0], note: ''
+    startDate: today, endDate: null, cancel: null, category: state.categories.expense[0], note: '', nextMonth: false
   };
   const preset = INTERVAL_PRESETS.find((p) => p.unit === item.interval.unit && p.every === item.interval.every);
   const intervalKey = preset ? preset.key : 'custom';
@@ -940,7 +1212,11 @@ function openEntrySheet(id) {
           <label class="field" data-show="newcat" hidden><span>Neue Kategorie</span>
             <input name="newCategory" maxlength="30" autocomplete="off" placeholder="Name">
           </label>
+          <label class="field switch-field"><span>Zählt für den Folgemonat</span>
+            <input class="switch" type="checkbox" name="nextMonth" role="switch"${item.nextMonth ? ' checked' : ''}>
+          </label>
         </div>
+        <p class="hint">Für Zahlungen am Monatsende, die eigentlich zum nächsten Monat gehören, etwa Gehalt oder Miete. Für den Kontostand zählt weiter das echte Datum.</p>
 
         ${existing ? `
         <div data-recurring>
@@ -1073,14 +1349,19 @@ function openEntrySheet(id) {
   });
   ['termEnd', 'renewMonths', 'notice', 'noticeUnit'].forEach((n) => form[n].addEventListener('input', renderCancelPreview));
   ['renewMonths', 'noticeUnit'].forEach((n) => form[n].addEventListener('change', renderCancelPreview));
+  let nextTouched = !!existing;
+  form.nextMonth.addEventListener('change', () => { nextTouched = true; });
+  const autoNext = () => { if (!nextTouched) form.nextMonth.checked = form.type.value === 'income' && form.category.value === 'Gehalt'; };
   form.category.addEventListener('change', () => {
     show('newcat', form.category.value === '__new');
     if (form.category.value === '__new') form.newCategory.focus();
+    autoNext();
   });
   form.querySelectorAll('input[name="type"]').forEach((r) => r.addEventListener('change', () => {
     const type = form.type.value;
     form.category.innerHTML = categoryOptions(type, state.categories[type][0]);
     show('newcat', false);
+    autoNext();
   }));
 
   sheet.addEventListener('click', (e) => {
@@ -1172,7 +1453,7 @@ function submitEntry(form, existing, draftPrices) {
   }
 
   const now = new Date().toISOString();
-  const data = { type, name, prices, interval: { unit, every }, startDate, endDate, cancel, category, note: form.note.value.trim() };
+  const data = { type, name, prices, interval: { unit, every }, startDate, endDate, cancel, category, note: form.note.value.trim(), nextMonth: form.nextMonth.checked };
 
   if (existing) {
     Object.assign(existing, data, { updatedAt: now });
@@ -1184,6 +1465,152 @@ function submitEntry(form, existing, draftPrices) {
   closeSheet();
   render();
   toast(existing ? `„${name}“ gesichert` : `„${name}“ hinzugefügt`);
+}
+
+function openSheet(title, formId, submitLabel, body) {
+  const root = $('#sheet-root');
+  root.innerHTML = `
+    <div class="sheet-backdrop" data-action="close-sheet"></div>
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+      <header class="sheet-head">
+        <button type="button" class="link" data-action="close-sheet">Abbrechen</button>
+        <h2 id="sheet-title">${title}</h2>
+        <button type="submit" class="link strong" form="${formId}">${submitLabel}</button>
+      </header>
+      <form id="${formId}" class="sheet-body" novalidate>${body}</form>
+    </div>`;
+  document.body.classList.add('sheet-open');
+  requestAnimationFrame(() => root.classList.add('open'));
+  return $(`#${formId}`);
+}
+
+/* ---------- Einzelne Zahlung anpassen ---------- */
+
+function openPaymentSheet(id, date) {
+  const item = state.items.find((i) => i.id === id);
+  if (!item) return;
+  if (isOnce(item)) { openEntrySheet(id); return; }
+  const base = priceAt(item, date);
+  const current = paymentAmount(item, date);
+  const overridden = hasOverride(item, date);
+  const bm = budgetMonth(item, date);
+  const meta = [`${D.weekday(date)}, ${D.long(date)}`, intervalLabel(item.interval)];
+  if (item.nextMonth) meta.push(`zählt für den ${MONTHS[bm.m - 1]}`);
+
+  const form = openSheet(esc(item.name), 'pay-form', 'Sichern', `
+    <p class="sheet-meta">${esc(meta.join(', '))}</p>
+    <div class="fields">
+      <label class="field"><span>Betrag diesmal</span>
+        <span class="money-input"><input name="amount" inputmode="decimal" autocomplete="off" value="${amountToInput(current)}"><em>€</em></span>
+      </label>
+    </div>
+    <p class="hint">Ändert nur diese eine Zahlung. Sonst gilt ${fmt(base)}. Mit 0 fällt sie diesmal aus.</p>
+    <p class="form-error" role="alert"></p>
+    <div class="sheet-actions">
+      ${overridden ? `<button type="button" class="btn" data-local="reset">Zurück auf ${fmt(base)}</button>` : ''}
+      <button type="button" class="btn" data-action="edit" data-id="${esc(item.id)}">Ganzen Eintrag bearbeiten</button>
+    </div>`);
+
+  const apply = (amount) => {
+    const o = { ...(item.overrides || {}) };
+    if (Math.abs(amount - base) < 0.005) delete o[date]; else o[date] = amount;
+    if (Object.keys(o).length) item.overrides = o; else delete item.overrides;
+    item.updatedAt = new Date().toISOString();
+    if (!save()) return;
+    closeSheet();
+    render();
+    toast(Math.abs(amount - base) < 0.005 ? `„${item.name}“ wieder ${fmt(base)}` : `„${item.name}“ am ${D.short(date)}: ${fmt(amount)}`);
+  };
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const raw = form.amount.value.trim();
+    const amount = raw === '' ? NaN : parseAmount(raw);
+    if (!(amount >= 0)) {
+      form.querySelector('.form-error').textContent = 'Gib einen Betrag ein, z. B. 1.200,00. Mit 0 fällt die Zahlung aus.';
+      form.amount.focus();
+      return;
+    }
+    apply(amount);
+  });
+  form.addEventListener('click', (e) => {
+    if (e.target.closest('[data-local="reset"]')) apply(base);
+  });
+}
+
+/* ---------- Kontostand ---------- */
+
+function openBalanceSheet() {
+  const bal = state.settings.balance;
+  const today = D.today();
+  let draft = { ...((bal && bal.booked) || {}) };
+
+  const form = openSheet('Kontostand', 'balance-form', 'Sichern', `
+    <div class="fields">
+      <label class="field"><span>Betrag</span>
+        <span class="money-input"><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0,00" value="${bal ? amountToInput(Math.abs(bal.amount)) : ''}"><em>€</em></span>
+      </label>
+      <label class="field switch-field"><span>Konto im Minus</span>
+        <input class="switch" type="checkbox" name="negative" role="switch"${bal && bal.amount < 0 ? ' checked' : ''}>
+      </label>
+      <label class="field"><span>Stand vom</span>
+        <input name="date" type="date" value="${bal ? bal.date : today}">
+      </label>
+    </div>
+    <p class="hint">Der Stand nach allen Buchungen dieses Tages, so wie ihn deine Banking-App zeigt.</p>
+
+    <h3 class="sheet-sub">Schon im Kontostand enthalten?</h3>
+    <ul class="plain-list" id="booked-list"></ul>
+    <p class="hint">Die App nimmt an, dass alles bis zum gewählten Tag gebucht ist und alles danach noch kommt. Stimmt das bei einer Zahlung nicht, schalte sie um.</p>
+    <p class="form-error" role="alert"></p>`);
+
+  const windowPayments = (date) => (D.valid(date)
+    ? paymentsBetween(D.addDays(date, -BOOK_WINDOW_DAYS), D.addDays(date, BOOK_WINDOW_DAYS))
+    : []);
+
+  function renderBooked() {
+    const date = form.date.value;
+    const list = windowPayments(date);
+    $('#booked-list').innerHTML = list.length ? list.map((p) => {
+      const k = payKey(p);
+      const on = Object.prototype.hasOwnProperty.call(draft, k) ? draft[k] : p.date <= date;
+      return `
+        <li class="whatif">
+          <span class="row-main"><span>${esc(p.item.name)}<small>${D.weekday(p.date)}, ${D.short(p.date)}</small></span><b class="${p.item.type === 'income' ? 'in' : ''}">${p.item.type === 'income' ? '+' : '−'}${fmt(p.amount)}</b></span>
+          <input class="switch" type="checkbox" role="switch" data-key="${esc(k)}" data-default="${p.date <= date}"${on ? ' checked' : ''} aria-label="${esc(p.item.name)} am ${D.short(p.date)} schon gebucht">
+        </li>`;
+    }).join('') : '<li class="muted-row">Keine geplanten Zahlungen rund um diesen Tag.</li>';
+  }
+  renderBooked();
+
+  form.date.addEventListener('change', renderBooked);
+  form.addEventListener('change', (e) => {
+    const k = e.target.dataset && e.target.dataset.key;
+    if (!k) return;
+    const def = e.target.dataset.default === 'true';
+    if (e.target.checked === def) delete draft[k]; else draft[k] = e.target.checked;
+  });
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const err = (msg, field) => { form.querySelector('.form-error').textContent = msg; if (field) form[field].focus(); };
+    const raw = form.amount.value.trim();
+    const amount = raw === '' ? NaN : parseAmount(raw.replace(/^-/, ''));
+    const date = form.date.value;
+    if (!(amount >= 0)) return err('Gib deinen Kontostand ein, z. B. 1.377,60.', 'amount');
+    if (!D.valid(date)) return err('Wähle das Datum des Kontostands.', 'date');
+    const keys = new Set(windowPayments(date).map(payKey));
+    const booked = {};
+    for (const [k, v] of Object.entries(draft)) if (keys.has(k)) booked[k] = v;
+    const negative = form.negative.checked || raw.startsWith('-');
+    state.settings.balance = { amount: negative ? -amount : amount, date, booked };
+    if (!save()) return;
+    closeSheet();
+    const d = D.parse(date);
+    if (D.mi(ui.month.y, ui.month.m) < D.mi(d.y, d.m)) ui.month = { y: d.y, m: d.m };
+    render();
+    toast('Kontostand gesichert');
+  });
 }
 
 function closeSheet() {
@@ -1288,6 +1715,8 @@ document.addEventListener('click', (e) => {
   switch (action) {
     case 'add': openEntrySheet(null); break;
     case 'edit': openEntrySheet(id); break;
+    case 'pay': openPaymentSheet(id, el.dataset.date); break;
+    case 'balance': openBalanceSheet(); break;
     case 'close-sheet': closeSheet(); break;
     case 'prev-month': ui.month = D.addMonths(ui.month, -1); render(); break;
     case 'next-month': ui.month = D.addMonths(ui.month, 1); render(); break;
@@ -1356,6 +1785,20 @@ document.addEventListener('change', (e) => {
     e.target.value = '';
     return;
   }
+  if (e.target.dataset && e.target.dataset.setting) {
+    const key = e.target.dataset.setting;
+    const val = e.target.value.trim() === '' ? 0 : parseAmount(e.target.value);
+    if (!(val >= 0)) {
+      toast('Gib einen Betrag ein, z. B. 290,00.');
+      e.target.value = amountToInput(state.settings[key]);
+      return;
+    }
+    state.settings[key] = val;
+    e.target.value = amountToInput(val);
+    save();
+    toast(key === 'foodBudget' ? `Essen: ${fmt(val)} pro Monat` : `Puffer: ${fmt(val)}`);
+    return;
+  }
   if (e.target.dataset && e.target.dataset.action === 'whatif') {
     const id = e.target.dataset.id;
     if (e.target.checked) ui.whatIfOff.delete(id); else ui.whatIfOff.add(id);
@@ -1408,5 +1851,6 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 // Für Tests und Fehlersuche
 window.__monatsausgaben = {
   D, monthSummary, occurrencesInMonth, monthlyAverage, nextOccurrence, priceAt, cancellationInfo, reserveRows, paymentsBetween,
+  budgetPayments, buildPlan, paymentAmount,
   migrate, parseAmount, get state() { return state; }
 };

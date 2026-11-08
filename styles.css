@@ -508,6 +508,63 @@ input.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2
 .combo select { flex: none; }
 .sheet-body > [data-recurring] > .fields + .hint { margin-top: 8px; }
 
+/* ---------- Kontostand und Spielraum ---------- */
+.balance-row {
+  width: 100%;
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px;
+  margin: 0 0 10px; padding: 11px 14px 11px 16px;
+  border-radius: var(--radius); background: var(--surface);
+  text-align: left;
+}
+.balance-row > span { color: var(--muted); font-size: 15px; }
+.balance-row b { font-family: var(--num); font-variant-numeric: tabular-nums; font-weight: 600; }
+.balance-row svg { width: 18px; height: 18px; color: var(--accent); }
+.balance-row:active { background: var(--surface-2); }
+b.neg, small.neg, .neg { color: var(--neg); }
+
+.room {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 16px 18px 18px;
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.room-label { font-size: 15px; color: var(--muted); }
+.room-value {
+  font-family: var(--num); font-variant-numeric: tabular-nums;
+  font-size: 46px; line-height: 1.1; font-weight: 700; letter-spacing: -0.02em;
+}
+.room p { margin: 6px 0 0; font-size: 15px; color: var(--muted); max-width: 32em; }
+.room.is-neg { background: color-mix(in srgb, var(--neg) 9%, var(--surface)); }
+.room.is-neg .room-value { color: var(--neg); }
+.room-empty .btn { align-self: flex-start; margin-top: 14px; }
+.room-past { margin: 0; padding: 12px 16px; border-radius: var(--radius); background: var(--surface); color: var(--muted); font-size: 15px; }
+.shortfall { margin-top: 10px; }
+
+.block.flow-block { margin-top: 14px; }
+.flow { list-style: none; margin: 0; padding: 4px 16px; background: var(--surface); border-radius: var(--radius); }
+.flow-row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 9px 0; }
+.flow-row + .flow-row { border-top: 1px solid var(--line); }
+.flow-row > span { display: flex; flex-direction: column; font-size: 15px; }
+.flow-row > span small { font-size: 13px; color: var(--muted); }
+.flow-row b { font-family: var(--num); font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+.flow-row.flow-total { border-top: 1.5px solid var(--ink); padding: 11px 0 10px; }
+.flow-row.flow-total > span { font-weight: 600; font-size: 17px; }
+.flow-row.flow-total b { font-size: 20px; }
+.flow-low { margin: 8px 4px 0; font-size: 14px; color: var(--muted); }
+.flow-low b { font-family: var(--num); font-variant-numeric: tabular-nums; font-weight: 600; color: var(--ink); }
+.flow-low b.neg { color: var(--neg); }
+
+.pay-right { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; }
+.pay-right small { font-size: 12px; color: var(--muted); font-family: var(--num); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pay-right small.neg { color: var(--neg); }
+.pay.booked { opacity: 0.55; }
+
+.sheet-meta { margin: 0 4px; font-size: 15px; color: var(--muted); }
+.field-link { width: 100%; text-align: left; }
+.field-link span:last-child { color: var(--accent); font-variant-numeric: tabular-nums; }
+.row-main > span small { display: block; font-size: 13px; color: var(--muted); }
+.row-main b.in { color: var(--in); }
+
 /* ---------- Hinweis-Toast ---------- */
 .toast {
   position: fixed; left: 50%; z-index: 30;
@@ -525,3 +582,5 @@ input.switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+.room-link { align-self: flex-start; margin-top: 8px; padding: 4px 0; color: var(--accent); font-weight: 600; font-size: 15px; }
+.sheet-body .sheet-sub { margin-top: 26px; }

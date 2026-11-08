@@ -1,6 +1,6 @@
 /* Service Worker: speichert die App-Dateien für die Offline-Nutzung.
    WICHTIG: Bei jedem Update CACHE_VERSION erhöhen, sonst lädt das iPhone die neue Version nicht. */
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const CACHE_NAME = 'monatsausgaben-' + CACHE_VERSION;
 
 const ASSETS = [
